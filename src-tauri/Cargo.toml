@@ -1,0 +1,37 @@
+[package]
+name = "backstage-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "backstage_app_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "backstage-app"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+backstage-core.workspace = true
+cap-std = "3"
+chrono = { version = "0.4", features = ["serde"] }
+directories = "6"
+hex = "0.4"
+parking_lot = "0.12"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tauri = { version = "2", features = [] }
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
+thiserror.workspace = true
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"

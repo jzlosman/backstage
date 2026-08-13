@@ -1,0 +1,23 @@
+schema: spec-driven
+
+context: |
+  Product: Backstage, a read-only desktop control tower for planning artifacts across repositories.
+  Stack: Rust and Tauri with a React and TypeScript frontend; macOS-first without a macOS-only core.
+  Privacy: Scanning, indexing, and caching stay local. Artifact content reaches Pi only after explicit user action.
+  Domain: Observed facts, deterministic assessments, heuristics, and AI-generated output must remain distinct.
+  Safety: Scanned repositories are strictly read-only. App-owned configuration and cache writes occur outside them.
+  UX: A permanent project rail anchors a three-pane, keyboard-first desktop shell for 10-20 projects and 50-200 bundles.
+  Sources of truth: PRODUCT.md and artifact-control-tower-v1.md.
+
+rules:
+  proposal:
+    - State explicit non-goals for the v1 vertical slice.
+  design:
+    - Preserve a pure Rust domain core separated from Tauri, filesystem, Git, cache, clock, Pi, clipboard, and launcher adapters.
+    - Treat repository contents as untrusted input.
+  specs:
+    - Distinguish deterministic facts from heuristic and generated states.
+    - Cover normal, rejection, recovery, and source-change concurrency scenarios where relevant.
+  tasks:
+    - Order tasks as vertical, testable increments rather than frontend-first or backend-first phases.
+    - Include verification tasks for repository immutability and path containment.

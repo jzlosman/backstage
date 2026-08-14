@@ -2,18 +2,21 @@
 
 ## Supported OpenSpec material
 
-Backstage v1 recognizes files below `openspec/changes/<change>/` when they match this set:
+Backstage v1 recognizes supported files in both current and archived OpenSpec changes:
 
-- `proposal.md`
-- `design.md`
-- `tasks.md`
-- `specs/<capability>/spec.md`
+- `openspec/changes/<change>/proposal.md`
+- `openspec/changes/<change>/design.md`
+- `openspec/changes/<change>/tasks.md`
+- `openspec/changes/<change>/specs/<capability>/spec.md`
+- The same member paths below `openspec/changes/archive/YYYY-MM-DD-<change>/`
 
-It groups these files into one OpenSpec change bundle. It parses task markers in `tasks.md` when a Markdown list item uses `- [ ]`, `- [x]`, `- [X]`, `* [ ]`, `* [x]`, or `* [X]`. Markers inside fenced code blocks do not count. Unsupported or malformed markers produce warnings; the source remains readable.
+It groups these files into one OpenSpec change bundle with the same Overview, Tasks, and Source reader in either location. Current changes with open or unavailable progress are **Active**. A current change with no open tasks is **Done**. A change in the archive is **Archived** regardless of its task counts; archival location and task progress remain separate facts.
 
-Candidate filenames `PLAN.md`, `plan.md`, `TDD.md`, `tdd.md`, `ROADMAP.md`, and `roadmap.md` appear as possible artifacts with their deterministic filename evidence in the default **Plan files** scope.
+Backstage parses task markers in `tasks.md` when a Markdown list item uses `- [ ]`, `- [x]`, `- [X]`, `* [ ]`, `* [x]`, or `* [X]`. Markers inside fenced code blocks do not count. Unsupported or malformed markers produce warnings; the source remains readable.
 
-The opt-in **All Markdown** scope indexes every safely readable `.md` file within the scan bounds. Ordinary Markdown remains an ordinary document: it receives no planning state, OpenSpec view, continuation prompt, or Pi workflow. Search and counts cover the complete index while the ledger mounts records in bounded batches.
+The default **Plan files** scope also includes Markdown paths matched by app-owned Rust-compatible regular expressions. Settings seeds removable patterns for `PLAN.md`/`plan.md`, `TDD.md`/`tdd.md`, and `ROADMAP.md`/`roadmap.md` at any project-relative depth. Users may remove every default, add global project-relative path patterns, or restore missing defaults. Pattern changes remain local and trigger bounded rescans of approved roots.
+
+The opt-in **All Markdown** scope indexes every safely readable `.md` file within the scan bounds. Ordinary Markdown remains an ordinary document: it receives no OpenSpec lifecycle, task progress, continuation prompt, or Pi workflow. Search and counts cover the complete index while the ledger mounts records in bounded batches. Every ledger scope sorts observed source modification times newest first under **Today**, **Past 7 days**, **Older**, and **Date unavailable** headings.
 
 ## Pi capability requirements
 
@@ -35,19 +38,19 @@ Generation stays disabled when the installed version, executable path, authentic
 
 ## App-owned data
 
-On macOS, the `directories` crate derives Backstage's configuration, cache, and data directories for organization `Earendil`, application `Backstage`, and bundle ID `works.earendil.backstage`. The SQLite index lives at the app data path as `backstage.sqlite3`. Pi isolation files live under the app cache path in `pi/`.
+On macOS, the `directories` crate derives Backstage's configuration, cache, and data directories for organization `Earendil`, application `Backstage`, and bundle ID `works.earendil.backstage`. Approved roots, planning patterns, indexes, generated views, and preferences live in the app data path as `backstage.sqlite3`. Pi isolation files live under the app cache path in `pi/`.
 
-Backstage writes no configuration, index, generated view, or preference data to an approved repository. Removing the app and its app-owned directories removes Backstage state; repositories need no rollback.
+Settings can remove an approved root and its unreachable app-owned index and generated views. This action never removes or changes the folder. Backstage writes no configuration, index, generated view, or preference data to an approved repository. Removing the app and its app-owned directories removes all Backstage state; repositories need no rollback.
 
 ## Detector gaps
 
 Backstage v1 does not claim support for:
 
-- planning classification for arbitrary filenames;
-- Wayfinder or evidence-folder structure;
-- broad TDD variants beyond deterministic candidate filenames;
-- every historical or future OpenSpec schema;
-- lifecycle labels such as abandoned;
+- planning detectors beyond project-relative Markdown regular expressions;
+- per-root or per-project planning-pattern overrides;
+- Wayfinder or evidence-folder semantics without a matching user pattern;
+- every historical or future OpenSpec schema or nonstandard archive layout;
+- lifecycle labels inferred from content, such as abandoned;
 - nested worktree grouping by shared Git directory;
 - browsing non-Markdown source files;
 - Superset deep links;

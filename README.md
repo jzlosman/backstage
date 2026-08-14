@@ -33,10 +33,13 @@ Approve a local folder. Backstage finds the Git projects below it and shows the 
 
 You can:
 
-- See OpenSpec changes as an overview, task list, or exact source.
-- Check task progress from the checkboxes in `tasks.md`.
-- Find common plan, TDD, and roadmap files.
-- Switch to **All Markdown** when the file you need has another name.
+- See current and archived OpenSpec changes as an overview, task list, or exact source.
+- Distinguish active, done, and archived changes from deterministic repository facts.
+- Find recently modified work first, grouped into clear date ranges.
+- Check open and done task counts from the checkboxes in `tasks.md`.
+- Configure regular expressions for the Markdown paths your planning tools create.
+- Switch to **All Markdown** when the file you need is not planning work.
+- Add and remove approved roots from Settings.
 - Search the full index without loading thousands of rows at once.
 
 ## Understand where it stands
@@ -82,8 +85,9 @@ This is a public preview.
 
 - The app is macOS-only.
 - OpenSpec support covers the file layout described in [`docs/v1-support.md`](docs/v1-support.md).
-- The default **Plan files** view recognizes OpenSpec changes and a small set of common planning names.
-- **All Markdown** can browse every safely indexed `.md` file, but ordinary documents do not receive planning status or Pi actions.
+- The default **Plan files** view recognizes current and archived OpenSpec changes plus Markdown paths matched by app-owned planning patterns.
+- Settings starts with removable defaults for common plan, TDD, and roadmap names; custom patterns apply globally.
+- **All Markdown** can browse every safely indexed `.md` file, but ordinary documents do not receive OpenSpec lifecycle, task progress, or Pi actions.
 - Pi summaries are optional and require the audited Pi setup listed in the support guide.
 - Backstage does not restore chat history or manage live agent sessions.
 

@@ -1,6 +1,7 @@
 use backstage_core::{
-    ArtifactRecognition, BundleKind, HandoffContext, OpenSpecProgress, ParserProvenance,
-    ProgressFallback, SourceLocation, TaskFact, TaskProgress, continuation_prompt,
+    ArtifactRecognition, BundleKind, HandoffContext, OpenSpecCustody, OpenSpecProgress,
+    ParserProvenance, ProgressFallback, SourceLocation, TaskFact, TaskProgress,
+    continuation_prompt,
 };
 
 fn context(progress: OpenSpecProgress) -> HandoffContext {
@@ -13,6 +14,7 @@ fn context(progress: OpenSpecProgress) -> HandoffContext {
         recognition: ArtifactRecognition::Recognized {
             detector: "openspec-v1".to_owned(),
         },
+        custody: Some(OpenSpecCustody::Current),
         progress,
         warnings: vec!["Git metadata unavailable".to_owned()],
     }
@@ -44,6 +46,28 @@ fn prompt_includes_paths_deterministic_status_and_explicit_continuation() {
     assert!(prompt.contains("Filter bundles (tasks.md:8)"));
     assert!(prompt.contains("Inspect the source files before continuing"));
     assert!(prompt.contains("Do not modify repository content unless the user explicitly asks"));
+}
+
+#[test]
+fn archived_prompt_identifies_custody_and_exact_source_path() {
+    let mut archived = context(OpenSpecProgress::Unavailable(ProgressFallback {
+        parser: ParserProvenance {
+            name: "openspec-task-markers".to_owned(),
+            version: "1".to_owned(),
+        },
+        warnings: vec![],
+    }));
+    archived.artifact_path =
+        "/Users/dev/workbench/openspec/changes/archive/2026-08-13-ship-search/tasks.md".to_owned();
+    archived.custody = Some(OpenSpecCustody::Archived {
+        archived_on: Some("2026-08-13".to_owned()),
+    });
+
+    let prompt = continuation_prompt(&archived);
+
+    assert!(prompt.contains("Custody: Archived on 2026-08-13"));
+    assert!(prompt.contains(&archived.artifact_path));
+    assert!(!prompt.contains("Custody: Current"));
 }
 
 #[test]

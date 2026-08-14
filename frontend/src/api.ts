@@ -43,6 +43,11 @@ export interface Recognition {
   reason?: string;
 }
 
+export type OpenSpecCustody =
+  { status: "current" } | { status: "archived"; archivedOn: string | null };
+
+export type OpenSpecPrimaryStatus = "active" | "done" | "archived";
+
 export interface Bundle {
   id: string;
   projectId: string;
@@ -51,6 +56,7 @@ export interface Bundle {
   kind: "open_spec_change" | "possible_artifact";
   recognition: Recognition;
   members: ArtifactMember[];
+  custody?: OpenSpecCustody;
 }
 
 export interface SourceLocation {
@@ -85,11 +91,14 @@ export type OpenSpecProgress =
       };
     };
 
+export type SourceTimestamp = string | number | null;
+
 export interface IndexedBundle {
   bundle: Bundle;
   progress: OpenSpecProgress;
+  primaryStatus?: OpenSpecPrimaryStatus;
   fingerprint: string | null;
-  sourceModifiedUnixNanos: number | null;
+  sourceModifiedUnixNanos: SourceTimestamp;
   warnings: string[];
 }
 
@@ -98,7 +107,7 @@ export interface MarkdownDocument {
   projectId: string;
   projectName: string;
   relativePath: string;
-  sourceModifiedUnixNanos: number | null;
+  sourceModifiedUnixNanos: SourceTimestamp;
 }
 
 export interface IndexedProject {
@@ -111,8 +120,33 @@ export interface IndexSnapshot {
   rootId: string;
   generation: number;
   indexedAt: string;
+  configurationRevision: number;
   projects: IndexedProject[];
   warnings: ScanWarning[];
+}
+
+export interface PlanningPattern {
+  id: string;
+  expression: string;
+  ordinal: number;
+  provenance: "default" | "custom";
+}
+
+export interface PlanningPatternConfiguration {
+  revision: number;
+  patterns: PlanningPattern[];
+}
+
+export interface PatternMutation {
+  patterns: PlanningPattern[];
+  configurationRevision: number;
+  indexes: IndexSnapshot[];
+  failedRootIds: string[];
+}
+
+export interface RootRemovalInventory {
+  roots: ApprovedRoot[];
+  indexes: IndexSnapshot[];
 }
 
 export type GeneratedView =
@@ -161,7 +195,7 @@ export interface MarkdownDetail {
   git: GitContext | null;
   relativePath: string;
   absolutePath: string;
-  sourceModifiedUnixNanos: number | null;
+  sourceModifiedUnixNanos: SourceTimestamp;
   markdown: string;
 }
 
@@ -177,9 +211,11 @@ export interface ArtifactDetail {
   members: ArtifactMember[];
   bundleKind: Bundle["kind"];
   recognition: Recognition;
+  custody?: OpenSpecCustody;
+  primaryStatus?: OpenSpecPrimaryStatus;
   relativePath: string;
   absolutePath: string;
-  sourceModifiedUnixNanos: number | null;
+  sourceModifiedUnixNanos: SourceTimestamp;
   markdown: string;
   progress: OpenSpecProgress;
   fingerprint: string | null;
@@ -191,7 +227,11 @@ export interface BackstageApi {
   listRoots(): Promise<ApprovedRoot[]>;
   chooseRoot(): Promise<string | null>;
   approveRoot(path: string): Promise<ApprovedRoot>;
-  removeRoot(rootId: string): Promise<void>;
+  removeRoot(rootId: string): Promise<RootRemovalInventory>;
+  listPatterns(): Promise<PlanningPatternConfiguration>;
+  addPattern(expression: string): Promise<PatternMutation>;
+  removePattern(id: string): Promise<PatternMutation>;
+  restoreDefaultPatterns(): Promise<PatternMutation>;
   scanRoot(rootId: string): Promise<DiscoveryResult>;
   cancelScan(rootId: string): Promise<boolean>;
   getIndex(rootId: string): Promise<IndexSnapshot | null>;
@@ -213,7 +253,11 @@ const tauriApi: BackstageApi = {
     return typeof selected === "string" ? selected : null;
   },
   approveRoot: (path) => invoke<ApprovedRoot>("approve_root", { path }),
-  removeRoot: (rootId) => invoke<void>("remove_root", { rootId }),
+  removeRoot: (rootId) => invoke<RootRemovalInventory>("remove_root", { rootId }),
+  listPatterns: () => invoke<PlanningPatternConfiguration>("list_patterns"),
+  addPattern: (expression) => invoke<PatternMutation>("add_pattern", { expression }),
+  removePattern: (id) => invoke<PatternMutation>("remove_pattern", { id }),
+  restoreDefaultPatterns: () => invoke<PatternMutation>("restore_default_patterns"),
   scanRoot: (rootId) => invoke<DiscoveryResult>("scan_root", { rootId }),
   cancelScan: (rootId) => invoke<boolean>("cancel_scan", { rootId }),
   getIndex: (rootId) => invoke<IndexSnapshot | null>("get_index", { rootId }),
@@ -311,7 +355,7 @@ const previewReadme: MarkdownDocument = {
   projectId: previewProject.id,
   projectName: previewProject.name,
   relativePath: "README.md",
-  sourceModifiedUnixNanos: 1786631000000000000,
+  sourceModifiedUnixNanos: "1786631000000000000",
 };
 
 const previewBundle: IndexedBundle = {
@@ -323,7 +367,9 @@ const previewBundle: IndexedBundle = {
     kind: "open_spec_change",
     recognition: { status: "recognized", detector: "openspec-v1" },
     members: previewMembers,
+    custody: { status: "current" },
   },
+  primaryStatus: "active",
   progress: {
     status: "available",
     progress: {
@@ -337,26 +383,39 @@ const previewBundle: IndexedBundle = {
     },
   },
   fingerprint: "sha256:c01d7e317566d94f7c5eae5910de5687",
-  sourceModifiedUnixNanos: 1786632000000000000,
+  sourceModifiedUnixNanos: "1786632000000000000",
   warnings: [],
 };
 
-const previewApi: BackstageApi = {
-  listRoots: async () => [previewRoot],
-  chooseRoot: async () => null,
-  approveRoot: async () => previewRoot,
-  removeRoot: async () => undefined,
-  scanRoot: async () => ({
-    projects: [previewProject],
-    warnings: [],
-    cancelled: false,
-    entriesInspected: 184,
-  }),
-  cancelScan: async () => false,
-  getIndex: async () => ({
+const previewDefaultPatterns: PlanningPattern[] = [
+  {
+    id: "preview-plan-pattern",
+    expression: "(?:^|/)(?:PLAN|plan)\\.md$",
+    ordinal: 0,
+    provenance: "default",
+  },
+  {
+    id: "preview-tdd-pattern",
+    expression: "(?:^|/)(?:TDD|tdd)\\.md$",
+    ordinal: 1,
+    provenance: "default",
+  },
+  {
+    id: "preview-roadmap-pattern",
+    expression: "(?:^|/)(?:ROADMAP|roadmap)\\.md$",
+    ordinal: 2,
+    provenance: "default",
+  },
+];
+let previewPatterns = [...previewDefaultPatterns];
+let previewPatternRevision = 0;
+
+function previewIndex(): IndexSnapshot {
+  return {
     rootId: previewRoot.id,
-    generation: 4,
+    generation: 4 + previewPatternRevision,
     indexedAt: "2026-08-13T12:04:00Z",
+    configurationRevision: previewPatternRevision,
     warnings: [],
     projects: [
       {
@@ -374,7 +433,62 @@ const previewApi: BackstageApi = {
         ],
       },
     ],
+  };
+}
+
+function previewPatternMutation(): PatternMutation {
+  return {
+    patterns: [...previewPatterns],
+    configurationRevision: previewPatternRevision,
+    indexes: [previewIndex()],
+    failedRootIds: [],
+  };
+}
+
+const previewApi: BackstageApi = {
+  listRoots: async () => [previewRoot],
+  chooseRoot: async () => null,
+  approveRoot: async () => previewRoot,
+  removeRoot: async () => ({ roots: [], indexes: [] }),
+  listPatterns: async () => ({
+    revision: previewPatternRevision,
+    patterns: [...previewPatterns],
   }),
+  addPattern: async (expression) => {
+    previewPatternRevision += 1;
+    previewPatterns = [
+      ...previewPatterns,
+      {
+        id: `preview-custom-${previewPatternRevision}`,
+        expression,
+        ordinal: previewPatterns.length,
+        provenance: "custom",
+      },
+    ];
+    return previewPatternMutation();
+  },
+  removePattern: async (id) => {
+    previewPatternRevision += 1;
+    previewPatterns = previewPatterns.filter((pattern) => pattern.id !== id);
+    return previewPatternMutation();
+  },
+  restoreDefaultPatterns: async () => {
+    previewPatternRevision += 1;
+    const ids = new Set(previewPatterns.map((pattern) => pattern.id));
+    previewPatterns = [
+      ...previewPatterns,
+      ...previewDefaultPatterns.filter((pattern) => !ids.has(pattern.id)),
+    ];
+    return previewPatternMutation();
+  },
+  scanRoot: async () => ({
+    projects: [previewProject],
+    warnings: [],
+    cancelled: false,
+    entriesInspected: 184,
+  }),
+  cancelScan: async () => false,
+  getIndex: async () => previewIndex(),
   getArtifactDetail: async (_rootId, artifactId) => {
     const selectedMember =
       previewMembers.find((member) => member.id === artifactId) ?? previewMembers[2]!;
@@ -399,6 +513,8 @@ const previewApi: BackstageApi = {
       bundleName: previewBundle.bundle.name,
       bundleKind: previewBundle.bundle.kind,
       recognition: previewBundle.bundle.recognition,
+      custody: previewBundle.bundle.custody,
+      primaryStatus: previewBundle.primaryStatus,
       members: previewBundle.bundle.members,
       relativePath: selectedMember.relativePath,
       absolutePath: `${previewProject.rootPath}/${selectedMember.relativePath}`,

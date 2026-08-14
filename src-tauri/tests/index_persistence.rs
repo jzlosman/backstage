@@ -4,8 +4,8 @@ use backstage_app_lib::index::{
 };
 use backstage_app_lib::storage::SqliteStore;
 use backstage_core::{
-    DetectorEvidence, EvidenceKind, SourceObservation, SourceSnapshot, classify_project,
-    fingerprint_snapshots, parse_openspec_tasks,
+    DetectorEvidence, EvidenceKind, OpenSpecCustody, OpenSpecPrimaryStatus, SourceObservation,
+    SourceSnapshot, classify_project, fingerprint_snapshots, parse_openspec_tasks,
 };
 
 fn index(generation: u64) -> IndexSnapshot {
@@ -35,6 +35,7 @@ fn index(generation: u64) -> IndexSnapshot {
         root_id: "root_1".to_owned(),
         generation,
         indexed_at: "2026-08-13T12:00:00Z".to_owned(),
+        configuration_revision: 0,
         projects: vec![IndexedProject {
             project: ProjectCandidate {
                 id: "project_1".to_owned(),
@@ -47,6 +48,7 @@ fn index(generation: u64) -> IndexSnapshot {
             bundles: vec![IndexedBundle {
                 bundle: bundles[0].clone(),
                 progress: parse_openspec_tasks(content),
+                primary_status: Some(OpenSpecPrimaryStatus::Active),
                 fingerprint: Some(fingerprint_snapshots(&[source])),
                 source_modified_unix_nanos: Some(42),
                 warnings: vec!["Parser retained readable source".to_owned()],
@@ -87,6 +89,42 @@ fn sqlite_round_trips_parsed_facts_fingerprints_and_warnings() {
 }
 
 #[test]
+fn indexed_bundle_timestamp_is_a_string_and_legacy_numeric_payloads_still_load() {
+    let mut payload = serde_json::to_value(index(1)).expect("serialize index");
+
+    assert_eq!(
+        payload["projects"][0]["bundles"][0]["sourceModifiedUnixNanos"],
+        serde_json::json!("42")
+    );
+
+    payload["projects"][0]["bundles"][0]["sourceModifiedUnixNanos"] = serde_json::json!(42);
+    let restored: IndexSnapshot = serde_json::from_value(payload).expect("load legacy timestamp");
+    assert_eq!(
+        restored.projects[0].bundles[0].source_modified_unix_nanos,
+        Some(42)
+    );
+}
+
+#[test]
+fn legacy_index_without_lifecycle_loads_as_current_with_derived_status() {
+    let mut payload = serde_json::to_value(index(1)).expect("serialize index");
+    let bundle = payload["projects"][0]["bundles"][0]
+        .as_object_mut()
+        .expect("indexed bundle object");
+    bundle.remove("primaryStatus");
+    bundle["bundle"]
+        .as_object_mut()
+        .expect("artifact bundle object")
+        .remove("custody");
+
+    let restored: IndexSnapshot = serde_json::from_value(payload).expect("load legacy index");
+    let restored = &restored.projects[0].bundles[0];
+
+    assert_eq!(restored.bundle.custody, Some(OpenSpecCustody::Current));
+    assert_eq!(restored.primary_status, Some(OpenSpecPrimaryStatus::Active));
+}
+
+#[test]
 fn legacy_index_without_markdown_documents_loads_with_an_empty_manifest() {
     let mut payload = serde_json::to_value(index(1)).expect("serialize index");
     payload["projects"][0]
@@ -97,6 +135,43 @@ fn legacy_index_without_markdown_documents_loads_with_an_empty_manifest() {
     let restored: IndexSnapshot = serde_json::from_value(payload).expect("load legacy index");
 
     assert!(restored.projects[0].markdown_documents.is_empty());
+}
+
+#[test]
+fn stale_index_saves_cannot_overwrite_newer_revision_or_generation_across_restart() {
+    let app_data = tempfile::TempDir::new().expect("app data");
+    let database = app_data.path().join("index.sqlite3");
+    let root = backstage_core::ApprovedRoot::new("/tmp", true).expect("root");
+    let mut current = index(8);
+    current.root_id = root.id().to_owned();
+    current.configuration_revision = 5;
+    current.indexed_at = "current".to_owned();
+    let mut stale_revision = index(99);
+    stale_revision.root_id = root.id().to_owned();
+    stale_revision.configuration_revision = 4;
+    stale_revision.indexed_at = "stale revision".to_owned();
+    let mut stale_generation = index(7);
+    stale_generation.root_id = root.id().to_owned();
+    stale_generation.configuration_revision = 5;
+    stale_generation.indexed_at = "stale generation".to_owned();
+
+    {
+        let store = SqliteStore::open(&database).expect("store");
+        store.upsert_root(&root).expect("store root");
+        store.save_index(&current).expect("save current");
+        store
+            .save_index(&stale_revision)
+            .expect("ignore stale revision");
+        store
+            .save_index(&stale_generation)
+            .expect("ignore stale generation");
+    }
+
+    let restarted = SqliteStore::open(&database).expect("restart store");
+    assert_eq!(
+        restarted.load_index(root.id()).expect("load current"),
+        Some(current)
+    );
 }
 
 #[test]

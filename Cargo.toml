@@ -12,6 +12,7 @@ version = "0.1.0"
 backstage-core = { path = "crates/backstage-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+regex = "1"
 sha2 = "0.10"
 thiserror = "2"
 

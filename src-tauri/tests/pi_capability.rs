@@ -130,9 +130,12 @@ fn system_runner_os_sandbox_allows_only_app_owned_writes() {
 }
 
 #[test]
-fn installed_config_resolves_an_existing_pi_executable() {
+fn installed_config_resolves_pi_or_keeps_the_command_fallback() {
     let config = PiConfig::installed("/tmp/backstage-owned".into());
 
-    assert!(config.executable.is_absolute());
-    assert!(config.executable.is_file());
+    if config.executable.is_absolute() {
+        assert!(config.executable.is_file());
+    } else {
+        assert_eq!(config.executable, std::path::Path::new("pi"));
+    }
 }

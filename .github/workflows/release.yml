@@ -134,6 +134,22 @@ jobs:
       - name: Build, sign, and notarize
         run: pnpm exec tauri build --target universal-apple-darwin --bundles app,dmg
 
+      - name: Notarize disk image
+        run: |
+          dmg_path="$(find target/universal-apple-darwin/release/bundle/dmg \
+            -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          [[ -n "$dmg_path" && -f "$dmg_path" ]] || {
+            echo 'The macOS build produced no DMG to notarize.' >&2
+            exit 1
+          }
+
+          xcrun notarytool submit "$dmg_path" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait
+          xcrun stapler staple "$dmg_path"
+
       - name: Verify and stage release assets
         run: |
           version="$(jq -r '.version' src-tauri/tauri.conf.json)"

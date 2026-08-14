@@ -46,6 +46,8 @@ require_match .github/workflows/release.yml 'universal-apple-darwin' 'a universa
 require_match .github/workflows/release.yml 'components:.*rustfmt,clippy' 'Rust formatting and lint components'
 require_match .github/workflows/release.yml 'APPLE_CERTIFICATE' 'the signing certificate secret'
 require_match .github/workflows/release.yml 'APPLE_API_KEY_PATH' 'the notarization key path'
+require_match .github/workflows/release.yml 'xcrun notarytool submit' 'explicit DMG notarization'
+require_match .github/workflows/release.yml 'xcrun stapler staple' 'explicit DMG stapling'
 require_match .github/workflows/release.yml "github.event_name == ['\"]push['\"]" 'tag-push-only publication'
 require_match .github/workflows/release.yml 'docs/releases/\$\{GITHUB_REF_NAME\}\.md' 'version-scoped release notes'
 require_match .github/workflows/release.yml '--prerelease' 'pre-release publication'

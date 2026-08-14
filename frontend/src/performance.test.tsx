@@ -52,6 +52,10 @@ describe("ledger scale", () => {
       chooseRoot: vi.fn(),
       approveRoot: vi.fn(),
       removeRoot: vi.fn(),
+      listPatterns: vi.fn().mockResolvedValue({ revision: 0, patterns: [] }),
+      addPattern: vi.fn(),
+      removePattern: vi.fn(),
+      restoreDefaultPatterns: vi.fn(),
       scanRoot: vi.fn().mockResolvedValue({
         projects,
         warnings: [],
@@ -63,6 +67,7 @@ describe("ledger scale", () => {
         rootId: "root_1",
         generation: 1,
         indexedAt: "now",
+        configurationRevision: 0,
         warnings: [],
         projects: projects.map((project) => ({
           project,
@@ -110,6 +115,10 @@ describe("ledger scale", () => {
       chooseRoot: vi.fn(),
       approveRoot: vi.fn(),
       removeRoot: vi.fn(),
+      listPatterns: vi.fn().mockResolvedValue({ revision: 0, patterns: [] }),
+      addPattern: vi.fn(),
+      removePattern: vi.fn(),
+      restoreDefaultPatterns: vi.fn(),
       scanRoot: vi.fn().mockResolvedValue({
         projects: [project],
         warnings: [],
@@ -121,6 +130,7 @@ describe("ledger scale", () => {
         rootId: root.id,
         generation: 1,
         indexedAt: "now",
+        configurationRevision: 0,
         warnings: [],
         projects: [{ project, bundles: [], markdownDocuments }],
       }),

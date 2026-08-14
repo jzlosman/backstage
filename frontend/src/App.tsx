@@ -5,11 +5,13 @@ import { CircleIcon } from "@phosphor-icons/react/dist/csr/Circle";
 import { CommandIcon } from "@phosphor-icons/react/dist/csr/Command";
 import { FilesIcon } from "@phosphor-icons/react/dist/csr/Files";
 import { FolderSimpleIcon } from "@phosphor-icons/react/dist/csr/FolderSimple";
+import { GearSixIcon } from "@phosphor-icons/react/dist/csr/GearSix";
 import { MagnifyingGlassIcon } from "@phosphor-icons/react/dist/csr/MagnifyingGlass";
 import { SidebarSimpleIcon } from "@phosphor-icons/react/dist/csr/SidebarSimple";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, RefObject } from "react";
 
+import { compareDatedRecords, groupDatedRecords, validSourceMilliseconds } from "./activity";
 import backstageMark from "./assets/backstage-mark.svg";
 import { runtimeApi } from "./api";
 import {
@@ -22,6 +24,7 @@ import {
   savePaneLayout,
 } from "./layout";
 import { renderMarkdown } from "./markdown";
+import { settleBatches } from "./settleBatches";
 import type {
   ApprovedRoot,
   ArtifactDetail,
@@ -32,23 +35,38 @@ import type {
   MarkdownDetail,
   MarkdownDocument,
   OpenSpecOverviewSection,
+  OpenSpecPrimaryStatus,
+  PatternMutation,
+  PlanningPattern,
   OpenSpecTaskGroup,
   Project,
   ScanWarning,
+  SourceTimestamp,
 } from "./api";
 
 type WorkspaceStatus =
   "loading" | "no-root" | "scanning" | "ready" | "ready-with-warnings" | "unavailable";
 type RegistryScope = "planning" | "markdown";
+type BundleFilter = "current" | "active" | "done" | "archived" | "warning" | "stale";
 type IndexedMarkdownDocument = MarkdownDocument & { rootId: string };
-
+type LedgerRecord =
+  | { kind: "bundle"; id: string; sourceModifiedUnixNanos: SourceTimestamp; bundle: IndexedBundle }
+  | {
+      kind: "document";
+      id: string;
+      sourceModifiedUnixNanos: SourceTimestamp;
+      document: IndexedMarkdownDocument;
+    };
 const LEDGER_BATCH_SIZE = 200;
+const GENERATED_INVENTORY_CONCURRENCY = 4;
+const systemClock = () => new Date();
 
 interface AppProps {
   api?: BackstageApi;
+  clock?: () => Date;
 }
 
-export function App({ api = runtimeApi }: AppProps) {
+export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
   const [roots, setRoots] = useState<ApprovedRoot[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [indexes, setIndexes] = useState<IndexSnapshot[]>([]);
@@ -57,14 +75,19 @@ export function App({ api = runtimeApi }: AppProps) {
   const [error, setError] = useState<string | null>(null);
   const [selectedProjectId, setSelectedProjectId] = useState("all");
   const [registryScope, setRegistryScope] = useState<RegistryScope>("planning");
-  const [bundleFilter, setBundleFilter] = useState<
-    "all" | "unfinished" | "warning" | "stale" | "recent"
-  >("all");
+  const [bundleFilter, setBundleFilter] = useState<BundleFilter>("current");
+  const [currentTime, setCurrentTime] = useState(clock);
   const [ledgerLimit, setLedgerLimit] = useState(LEDGER_BATCH_SIZE);
   const [selectedArtifact, setSelectedArtifact] = useState<ArtifactDetail | null>(null);
   const [selectedMarkdown, setSelectedMarkdown] = useState<MarkdownDetail | null>(null);
   const selectedArtifactRef = useRef<ArtifactDetail | null>(null);
   const detailRequestRef = useRef(0);
+  const scanRequestRef = useRef(0);
+  const inventoryEpochRef = useRef(0);
+  const patternRequestRef = useRef(0);
+  const patternMutationRef = useRef(0);
+  const patternRevisionRef = useRef(0);
+  const settingsMutationRef = useRef(false);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [handoffNotice, setHandoffNotice] = useState<string | null>(null);
   const [generatedView, setGeneratedView] = useState<GeneratedView>({ status: "never_generated" });
@@ -73,19 +96,51 @@ export function App({ api = runtimeApi }: AppProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [paletteQuery, setPaletteQuery] = useState("");
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [appMode, setAppMode] = useState<"work" | "settings">("work");
+  const [patterns, setPatterns] = useState<PlanningPattern[]>([]);
+  const [patternRevision, setPatternRevision] = useState(0);
+  const [patternsLoading, setPatternsLoading] = useState(true);
+  const [settingsBusy, setSettingsBusy] = useState(false);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
+  const [failedPatternRootIds, setFailedPatternRootIds] = useState<string[]>([]);
+  const [confirmingRootId, setConfirmingRootId] = useState<string | null>(null);
+  const [removingRootId, setRemovingRootId] = useState<string | null>(null);
   const paletteTriggerRef = useRef<HTMLButtonElement>(null);
+  const settingsTriggerRef = useRef<HTMLButtonElement>(null);
+  const settingsHeadingRef = useRef<HTMLHeadingElement>(null);
+  const planningPatternInputRef = useRef<HTMLInputElement>(null);
+  const settingsOpenerRef = useRef<HTMLElement | null>(null);
   const paletteInputRef = useRef<HTMLInputElement>(null);
   const restorePaletteFocusRef = useRef(false);
   const resizeCleanupRef = useRef<(() => void) | null>(null);
   const readingDeskRef = useRef<HTMLElement>(null);
 
+  useEffect(() => {
+    let timer = 0;
+    const scheduleRegroup = () => {
+      const now = clock();
+      setCurrentTime(now);
+      const nextMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+      timer = window.setTimeout(
+        scheduleRegroup,
+        Math.max(1, nextMidnight.getTime() - now.getTime() + 25),
+      );
+    };
+    scheduleRegroup();
+    return () => window.clearTimeout(timer);
+  }, [clock]);
+
   const scan = useCallback(
     async (nextRoots: ApprovedRoot[]) => {
+      const requestId = ++scanRequestRef.current;
       if (nextRoots.length === 0) {
+        ++inventoryEpochRef.current;
         setProjects([]);
+        setIndexes([]);
         setWarnings([]);
         setStatus("no-root");
-        return;
+        return true;
       }
 
       setStatus("scanning");
@@ -94,16 +149,19 @@ export function App({ api = runtimeApi }: AppProps) {
         const cachedIndexes = (
           await Promise.all(nextRoots.map((root) => api.getIndex(root.id)))
         ).filter((index): index is IndexSnapshot => index !== null);
+        if (requestId !== scanRequestRef.current) return;
         if (cachedIndexes.length > 0) {
           setIndexes(cachedIndexes);
           setProjects(cachedIndexes.flatMap((index) => index.projects.map((item) => item.project)));
         }
         const results = await Promise.all(nextRoots.map((root) => api.scanRoot(root.id)));
+        if (requestId !== scanRequestRef.current) return;
         const nextProjects = results.flatMap((result) => result.projects);
         const nextWarnings = results.flatMap((result) => result.warnings);
         const nextIndexes = (
           await Promise.all(nextRoots.map((root) => api.getIndex(root.id)))
         ).filter((index): index is IndexSnapshot => index !== null);
+        if (requestId !== scanRequestRef.current) return;
         const bundleOwners = new Map<string, { rootId: string; bundle: IndexedBundle }>();
         for (const index of [...nextIndexes].sort((left, right) =>
           left.rootId.localeCompare(right.rootId),
@@ -116,15 +174,15 @@ export function App({ api = runtimeApi }: AppProps) {
             }
           }
         }
-        const generatedEntries = await Promise.all(
-          [...bundleOwners.values()].map(
-            async ({ rootId, bundle }) =>
-              [bundle.bundle.id, await api.getGeneratedView(rootId, bundle.bundle.id)] as const,
-          ),
-        );
+        const inventoryEpoch = ++inventoryEpochRef.current;
+        const retainedBundleIds = new Set(bundleOwners.keys());
         setProjects(nextProjects);
         setIndexes(nextIndexes);
-        setGeneratedInventory(Object.fromEntries(generatedEntries));
+        setGeneratedInventory((inventory) =>
+          Object.fromEntries(
+            Object.entries(inventory).filter(([bundleId]) => retainedBundleIds.has(bundleId)),
+          ),
+        );
         setWarnings(nextWarnings);
         const projectIdsWithWork = new Set(
           nextIndexes.flatMap((index) =>
@@ -139,13 +197,64 @@ export function App({ api = runtimeApi }: AppProps) {
           current === "all" || projectIdsWithWork.has(current) ? current : "all",
         );
         setStatus(nextWarnings.length > 0 ? "ready-with-warnings" : "ready");
+
+        const isCurrentInventory = () =>
+          requestId === scanRequestRef.current && inventoryEpoch === inventoryEpochRef.current;
+        void settleBatches(
+          [...bundleOwners.values()],
+          GENERATED_INVENTORY_CONCURRENCY,
+          ({ rootId, bundle }) => api.getGeneratedView(rootId, bundle.bundle.id),
+          (batch) => {
+            if (!isCurrentInventory()) return;
+            const generatedEntries = batch.flatMap(({ item, result }) =>
+              result.status === "fulfilled"
+                ? ([[item.bundle.bundle.id, result.value]] as const)
+                : [],
+            );
+            if (generatedEntries.length === 0) return;
+            setGeneratedInventory((inventory) =>
+              isCurrentInventory()
+                ? { ...inventory, ...Object.fromEntries(generatedEntries) }
+                : inventory,
+            );
+          },
+          isCurrentInventory,
+        );
+        return true;
       } catch (cause) {
+        if (requestId !== scanRequestRef.current) return;
         setError(errorMessage(cause));
         setStatus("unavailable");
+        return false;
       }
     },
     [api],
   );
+
+  const loadPatterns = useCallback(async () => {
+    const requestId = ++patternRequestRef.current;
+    setPatternsLoading(true);
+    try {
+      const configuration = await api.listPatterns();
+      if (
+        requestId !== patternRequestRef.current ||
+        configuration.revision < patternRevisionRef.current
+      )
+        return;
+      patternRevisionRef.current = configuration.revision;
+      setPatterns(configuration.patterns);
+      setPatternRevision(configuration.revision);
+      setSettingsError(null);
+    } catch (cause) {
+      if (requestId === patternRequestRef.current) setSettingsError(errorMessage(cause));
+    } finally {
+      if (requestId === patternRequestRef.current) setPatternsLoading(false);
+    }
+  }, [api]);
+
+  useEffect(() => {
+    void loadPatterns();
+  }, [loadPatterns]);
 
   useEffect(() => {
     let active = true;
@@ -167,39 +276,224 @@ export function App({ api = runtimeApi }: AppProps) {
   }, [api, scan]);
 
   const approveRoot = async () => {
+    if (settingsMutationRef.current) return;
+    settingsMutationRef.current = true;
+    setSettingsBusy(true);
     try {
       const path = await api.chooseRoot();
       if (!path) return;
       setStatus("scanning");
       setError(null);
+      setSettingsError(null);
       const root = await api.approveRoot(path);
-      const nextRoots = roots.some((candidate) => candidate.id === root.id)
-        ? roots
-        : [...roots, root];
+      const alreadyApproved = roots.some((candidate) => candidate.id === root.id);
+      const nextRoots = alreadyApproved ? roots : [...roots, root];
       setRoots(nextRoots);
+      setSettingsNotice(
+        alreadyApproved
+          ? "That folder was already approved; one approval remains."
+          : "Root approved. Scanning read-only.",
+      );
       await scan(nextRoots);
     } catch (cause) {
-      setError(errorMessage(cause));
+      const message = errorMessage(cause);
+      setError(message);
+      setSettingsError(message);
       setStatus(roots.length > 0 ? "unavailable" : "no-root");
+    } finally {
+      settingsMutationRef.current = false;
+      setSettingsBusy(false);
     }
+  };
+
+  const replaceIndexInventory = (nextIndexes: IndexSnapshot[]) => {
+    ++scanRequestRef.current;
+    ++detailRequestRef.current;
+    ++inventoryEpochRef.current;
+    setIndexes(nextIndexes);
+    setProjects(nextIndexes.flatMap((index) => index.projects.map((item) => item.project)));
+    setWarnings(nextIndexes.flatMap((index) => index.warnings));
+    const retainedBundleIds = new Set(
+      nextIndexes.flatMap((index) =>
+        index.projects.flatMap((project) => project.bundles.map((bundle) => bundle.bundle.id)),
+      ),
+    );
+    const retainedDocumentIds = new Set(
+      nextIndexes.flatMap((index) =>
+        index.projects.flatMap((project) =>
+          project.markdownDocuments.map((document) => document.id),
+        ),
+      ),
+    );
+    setGeneratedInventory((inventory) =>
+      Object.fromEntries(Object.entries(inventory).filter(([id]) => retainedBundleIds.has(id))),
+    );
+    if (selectedArtifact && retainedBundleIds.has(selectedArtifact.bundleId)) {
+      const retainedOwner = [...nextIndexes]
+        .sort((left, right) => left.rootId.localeCompare(right.rootId))
+        .find((index) =>
+          index.projects.some((project) =>
+            project.bundles.some((bundle) => bundle.bundle.id === selectedArtifact.bundleId),
+          ),
+        );
+      if (retainedOwner && retainedOwner.rootId !== selectedArtifact.rootId) {
+        const retainedDetail = { ...selectedArtifact, rootId: retainedOwner.rootId };
+        selectedArtifactRef.current = retainedDetail;
+        setSelectedArtifact(retainedDetail);
+      }
+    }
+    if (selectedMarkdown && retainedDocumentIds.has(selectedMarkdown.documentId)) {
+      const retainedOwner = [...nextIndexes]
+        .sort((left, right) => left.rootId.localeCompare(right.rootId))
+        .find((index) =>
+          index.projects.some((project) =>
+            project.markdownDocuments.some(
+              (document) => document.id === selectedMarkdown.documentId,
+            ),
+          ),
+        );
+      if (retainedOwner && retainedOwner.rootId !== selectedMarkdown.rootId) {
+        setSelectedMarkdown({ ...selectedMarkdown, rootId: retainedOwner.rootId });
+      }
+    }
+  };
+
+  const openSettings = (opener: HTMLElement | null) => {
+    settingsOpenerRef.current = opener;
+    setAppMode("settings");
+    setSettingsError(null);
+    setSettingsNotice(null);
+    void loadPatterns();
+  };
+
+  const closeSettings = () => {
+    settingsOpenerRef.current?.focus();
+    setAppMode("work");
+    setConfirmingRootId(null);
+  };
+
+  useEffect(() => {
+    if (appMode === "settings") settingsHeadingRef.current?.focus();
+  }, [appMode]);
+
+  const removeApprovedRoot = async (rootId: string) => {
+    if (settingsMutationRef.current) return;
+    settingsMutationRef.current = true;
+    setSettingsBusy(true);
+    setRemovingRootId(rootId);
+    setSettingsError(null);
+    setSettingsNotice(null);
+    try {
+      const inventory = await api.removeRoot(rootId);
+      const retainedRootIds = new Set(inventory.roots.map((root) => root.id));
+      setRoots(inventory.roots);
+      setFailedPatternRootIds((ids) => ids.filter((id) => retainedRootIds.has(id)));
+      replaceIndexInventory(inventory.indexes);
+      setConfirmingRootId(null);
+      setStatus(inventory.roots.length === 0 ? "no-root" : "ready");
+      setSettingsNotice("Approval removed. Repository files remain untouched.");
+      requestAnimationFrame(() => settingsHeadingRef.current?.focus());
+    } catch (cause) {
+      setSettingsError(errorMessage(cause));
+    } finally {
+      settingsMutationRef.current = false;
+      setSettingsBusy(false);
+      setRemovingRootId(null);
+    }
+  };
+
+  const applyPatternMutation = async (
+    mutation: () => Promise<PatternMutation>,
+    focusAfterRemoval = false,
+  ) => {
+    if (settingsMutationRef.current) return;
+    settingsMutationRef.current = true;
+    setSettingsBusy(true);
+    const mutationId = ++patternMutationRef.current;
+    setSettingsError(null);
+    setSettingsNotice(null);
+    try {
+      const result = await mutation();
+      if (
+        mutationId !== patternMutationRef.current ||
+        result.configurationRevision < patternRevisionRef.current
+      )
+        return;
+      ++patternRequestRef.current;
+      patternRevisionRef.current = result.configurationRevision;
+      setPatterns(result.patterns);
+      setPatternRevision(result.configurationRevision);
+      setPatternsLoading(false);
+      setFailedPatternRootIds(result.failedRootIds);
+      replaceIndexInventory(result.indexes);
+      const indexWarnings = result.indexes.flatMap((index) => index.warnings);
+      setStatus(
+        roots.length === 0
+          ? "no-root"
+          : result.failedRootIds.length > 0 || indexWarnings.length > 0
+            ? "ready-with-warnings"
+            : "ready",
+      );
+      setSettingsNotice("Planning patterns saved in app-owned configuration.");
+      if (focusAfterRemoval) requestAnimationFrame(() => planningPatternInputRef.current?.focus());
+    } catch (cause) {
+      if (mutationId === patternMutationRef.current) setSettingsError(errorMessage(cause));
+    } finally {
+      settingsMutationRef.current = false;
+      if (mutationId === patternMutationRef.current) setSettingsBusy(false);
+    }
+  };
+
+  const retryFailedPatternRoots = async () => {
+    if (await scan(roots)) setFailedPatternRootIds([]);
   };
 
   const projectFileCounts = useMemo(() => {
     const memberIds = new Map<string, Set<string>>();
+    const query = searchQuery.trim().toLowerCase();
     for (const index of indexes) {
       for (const indexedProject of index.projects) {
         const projectMembers = memberIds.get(indexedProject.project.id) ?? new Set<string>();
-        for (const bundle of indexedProject.bundles) {
+        const matchingBundles = indexedProject.bundles.filter(
+          (bundle) =>
+            bundleMatchesFilter(bundle, bundleFilter, generatedInventory) &&
+            (!query ||
+              [
+                bundle.bundle.name,
+                bundle.bundle.projectName,
+                ...bundle.bundle.members.map((member) => member.relativePath),
+              ]
+                .join(" ")
+                .toLowerCase()
+                .includes(query)),
+        );
+        for (const bundle of matchingBundles) {
           for (const member of bundle.bundle.members) projectMembers.add(member.id);
         }
-        if (registryScope === "markdown") {
-          for (const document of indexedProject.markdownDocuments) projectMembers.add(document.id);
+        if (registryScope === "markdown" && bundleFilter === "current") {
+          const represented = new Set(
+            indexedProject.bundles.flatMap((bundle) =>
+              bundle.bundle.members.map((member) => member.id),
+            ),
+          );
+          for (const document of indexedProject.markdownDocuments) {
+            if (
+              !represented.has(document.id) &&
+              (!query ||
+                [document.relativePath, document.projectName]
+                  .join(" ")
+                  .toLowerCase()
+                  .includes(query))
+            ) {
+              projectMembers.add(document.id);
+            }
+          }
         }
         memberIds.set(indexedProject.project.id, projectMembers);
       }
     }
     return new Map([...memberIds].map(([projectId, members]) => [projectId, members.size]));
-  }, [indexes, registryScope]);
+  }, [bundleFilter, generatedInventory, indexes, registryScope, searchQuery]);
 
   const workProjects = useMemo(() => {
     const unique = new Map<string, Project>();
@@ -228,37 +522,35 @@ export function App({ api = runtimeApi }: AppProps) {
     }
   }, [selectedProjectId, workProjects]);
 
-  const visibleBundles = useMemo(() => {
-    const unique = new Map<string, IndexedBundle>();
-    for (const bundle of indexes.flatMap((index) =>
-      index.projects.flatMap((project) =>
-        project.bundles.filter(
-          (bundle) => selectedProjectId === "all" || bundle.bundle.projectId === selectedProjectId,
-        ),
-      ),
+  const visibleRecords = useMemo(() => {
+    const uniqueBundles = new Map<string, IndexedBundle>();
+    const uniqueDocuments = new Map<string, IndexedMarkdownDocument>();
+    for (const index of [...indexes].sort((left, right) =>
+      left.rootId.localeCompare(right.rootId),
     )) {
-      if (!unique.has(bundle.bundle.id)) unique.set(bundle.bundle.id, bundle);
+      for (const project of index.projects) {
+        if (selectedProjectId !== "all" && project.project.id !== selectedProjectId) continue;
+        for (const bundle of project.bundles) {
+          if (!uniqueBundles.has(bundle.bundle.id)) uniqueBundles.set(bundle.bundle.id, bundle);
+        }
+        if (registryScope !== "markdown") continue;
+        const represented = new Set(
+          project.bundles.flatMap((bundle) => bundle.bundle.members.map((member) => member.id)),
+        );
+        for (const document of project.markdownDocuments) {
+          if (!represented.has(document.id) && !uniqueDocuments.has(document.id)) {
+            uniqueDocuments.set(document.id, { ...document, rootId: index.rootId });
+          }
+        }
+      }
     }
-    const bundles = [...unique.values()];
-    const filtered =
-      bundleFilter === "unfinished"
-        ? bundles.filter(
-            (bundle) =>
-              bundle.progress.status === "available" && bundle.progress.progress.remainingCount > 0,
-          )
-        : bundleFilter === "warning"
-          ? bundles.filter(
-              (bundle) =>
-                bundle.warnings.length > 0 || bundle.progress.progress.warnings.length > 0,
-            )
-          : bundleFilter === "stale"
-            ? bundles.filter((bundle) => generatedInventory[bundle.bundle.id]?.status === "stale")
-            : bundleFilter === "recent"
-              ? recentBundles(bundles)
-              : bundles;
+
     const query = searchQuery.trim().toLowerCase();
-    return query
-      ? filtered.filter((bundle) =>
+    const bundles = [...uniqueBundles.values()]
+      .filter((bundle) => bundleMatchesFilter(bundle, bundleFilter, generatedInventory))
+      .filter(
+        (bundle) =>
+          !query ||
           [
             bundle.bundle.name,
             bundle.bundle.projectName,
@@ -267,128 +559,172 @@ export function App({ api = runtimeApi }: AppProps) {
             .join(" ")
             .toLowerCase()
             .includes(query),
-        )
-      : filtered;
-  }, [bundleFilter, generatedInventory, indexes, searchQuery, selectedProjectId]);
-
-  const visibleDocuments = useMemo(() => {
-    if (registryScope !== "markdown" || bundleFilter !== "all") return [];
-    const query = searchQuery.trim().toLowerCase();
-    const documents = indexes
-      .flatMap((index) =>
-        index.projects.flatMap((project) => {
-          if (selectedProjectId !== "all" && project.project.id !== selectedProjectId) return [];
-          const represented = new Set(
-            project.bundles.flatMap((bundle) => bundle.bundle.members.map((member) => member.id)),
-          );
-          return project.markdownDocuments
-            .filter((document) => !represented.has(document.id))
-            .map((document) => ({ ...document, rootId: index.rootId }));
-        }),
       )
-      .sort(
-        (left, right) => left.id.localeCompare(right.id) || left.rootId.localeCompare(right.rootId),
-      );
-    const unique = new Map<string, IndexedMarkdownDocument>();
-    for (const document of documents) {
-      if (!unique.has(document.id)) unique.set(document.id, document);
-    }
-    return [...unique.values()]
-      .filter(
-        (document) =>
-          !query ||
-          [document.relativePath, document.projectName].join(" ").toLowerCase().includes(query),
-      )
-      .sort(
-        (left, right) =>
-          left.relativePath.toLowerCase().localeCompare(right.relativePath.toLowerCase()) ||
-          left.id.localeCompare(right.id),
-      );
-  }, [bundleFilter, indexes, registryScope, searchQuery, selectedProjectId]);
+      .map((bundle): LedgerRecord => ({
+        kind: "bundle",
+        id: bundle.bundle.id,
+        sourceModifiedUnixNanos: bundle.sourceModifiedUnixNanos,
+        bundle,
+      }));
+    const documents =
+      bundleFilter === "current"
+        ? [...uniqueDocuments.values()]
+            .filter(
+              (document) =>
+                !query ||
+                [document.relativePath, document.projectName]
+                  .join(" ")
+                  .toLowerCase()
+                  .includes(query),
+            )
+            .map((document): LedgerRecord => ({
+              kind: "document",
+              id: document.id,
+              sourceModifiedUnixNanos: document.sourceModifiedUnixNanos,
+              document,
+            }))
+        : [];
+    return [...bundles, ...documents].sort(compareDatedRecords);
+  }, [bundleFilter, generatedInventory, indexes, registryScope, searchQuery, selectedProjectId]);
 
-  const visibleRecordCount = visibleBundles.length + visibleDocuments.length;
-  const visibleFileCount = new Set([
-    ...visibleBundles.flatMap((bundle) => bundle.bundle.members.map((member) => member.id)),
-    ...visibleDocuments.map((document) => document.id),
-  ]).size;
-  const displayedBundles = visibleBundles.slice(0, ledgerLimit);
-  const displayedDocuments = visibleDocuments.slice(
-    0,
-    Math.max(0, ledgerLimit - displayedBundles.length),
-  );
-  const remainingRecordCount = Math.max(
-    0,
-    visibleRecordCount - displayedBundles.length - displayedDocuments.length,
-  );
+  const visibleRecordCount = visibleRecords.length;
+  const visibleFileCount = new Set(
+    visibleRecords.flatMap((record) =>
+      record.kind === "bundle"
+        ? record.bundle.bundle.members.map((member) => member.id)
+        : [record.document.id],
+    ),
+  ).size;
+  const displayedRecords = visibleRecords.slice(0, ledgerLimit);
+  const displayedGroups = groupDatedRecords(displayedRecords, currentTime);
+  const remainingRecordCount = Math.max(0, visibleRecordCount - displayedRecords.length);
 
   useEffect(
     () => setLedgerLimit(LEDGER_BATCH_SIZE),
     [bundleFilter, indexes, registryScope, searchQuery, selectedProjectId],
   );
 
-  const commitSelectedArtifact = (detail: ArtifactDetail) => {
+  const commitSelectedArtifact = useCallback((detail: ArtifactDetail) => {
     selectedArtifactRef.current = detail;
     setSelectedMarkdown(null);
     setSelectedArtifact(detail);
-  };
+  }, []);
 
-  const commitSelectedMarkdown = (detail: MarkdownDetail) => {
+  const commitSelectedMarkdown = useCallback((detail: MarkdownDetail) => {
     selectedArtifactRef.current = null;
     setSelectedArtifact(null);
     setSelectedMarkdown(detail);
     setGeneratedView({ status: "never_generated" });
-  };
+  }, []);
 
-  const selectBundle = async (bundle: IndexedBundle) => {
-    const root = [...indexes]
-      .sort((left, right) => left.rootId.localeCompare(right.rootId))
-      .find((index) =>
-        index.projects.some((project) =>
-          project.bundles.some((candidate) => candidate.bundle.id === bundle.bundle.id),
-        ),
+  const selectBundle = useCallback(
+    async (bundle: IndexedBundle) => {
+      const root = [...indexes]
+        .sort((left, right) => left.rootId.localeCompare(right.rootId))
+        .find((index) =>
+          index.projects.some((project) =>
+            project.bundles.some((candidate) => candidate.bundle.id === bundle.bundle.id),
+          ),
+        );
+      const taskMember = bundle.bundle.members.find(
+        (candidate) => fileLabel(candidate.relativePath) === "tasks.md",
       );
-    const member =
-      bundle.bundle.members.find((candidate) => candidate.relativePath.endsWith("tasks.md")) ??
-      bundle.bundle.members[0];
-    if (!root || !member) return;
-    const requestId = ++detailRequestRef.current;
-    try {
-      setDetailError(null);
-      const [detail, generated] = await Promise.all([
-        api.getArtifactDetail(root.rootId, member.id),
-        api.getGeneratedView(root.rootId, bundle.bundle.id),
-      ]);
-      if (requestId !== detailRequestRef.current) return;
-      commitSelectedArtifact(detail);
-      setGeneratedView(generated);
-      setGeneratedInventory((inventory) => ({ ...inventory, [bundle.bundle.id]: generated }));
-      if (window.innerWidth <= 960) {
-        setPaneLayout((layout) => ({ ...layout, ledgerCollapsed: true }));
+      const member =
+        (bundle.progress.status === "available" ? taskMember : undefined) ??
+        bundle.bundle.members.find(
+          (candidate) => fileLabel(candidate.relativePath) === "proposal.md",
+        ) ??
+        bundle.bundle.members.find(
+          (candidate) => fileLabel(candidate.relativePath) === "design.md",
+        ) ??
+        bundle.bundle.members.find(
+          (candidate) => fileLabel(candidate.relativePath) !== "tasks.md",
+        ) ??
+        taskMember ??
+        bundle.bundle.members[0];
+      if (!root || !member) return;
+      const requestId = ++detailRequestRef.current;
+      const inventoryEpoch = inventoryEpochRef.current;
+      const generatedRequest = Promise.resolve()
+        .then(() => api.getGeneratedView(root.rootId, bundle.bundle.id))
+        .then(
+          (view) => ({ status: "fulfilled" as const, view }),
+          (cause: unknown) => ({ status: "rejected" as const, cause }),
+        );
+      try {
+        setDetailError(null);
+        const detail = await api.getArtifactDetail(root.rootId, member.id);
+        if (requestId !== detailRequestRef.current) return;
+        commitSelectedArtifact(detail);
+        setGeneratedView(generatedInventory[bundle.bundle.id] ?? { status: "never_generated" });
+        if (window.innerWidth <= 960) {
+          setPaneLayout((layout) => ({ ...layout, ledgerCollapsed: true }));
+        }
+      } catch (cause) {
+        if (requestId === detailRequestRef.current) setDetailError(errorMessage(cause));
+        return;
       }
-    } catch (cause) {
-      if (requestId === detailRequestRef.current) setDetailError(errorMessage(cause));
-    }
-  };
 
-  const selectDocument = async (document: IndexedMarkdownDocument) => {
-    const requestId = ++detailRequestRef.current;
-    try {
-      setDetailError(null);
-      const detail = await api.getMarkdownDetail(document.rootId, document.id);
-      if (requestId !== detailRequestRef.current) return;
-      commitSelectedMarkdown(detail);
-      if (window.innerWidth <= 960) {
-        setPaneLayout((layout) => ({ ...layout, ledgerCollapsed: true }));
+      const generated = await generatedRequest;
+      if (requestId !== detailRequestRef.current || inventoryEpoch !== inventoryEpochRef.current)
+        return;
+      if (generated.status === "rejected") {
+        setGeneratedView({
+          status: "never_generated",
+          capabilityReason: `Generated summary unavailable: ${errorMessage(generated.cause)}`,
+        });
+        return;
       }
-    } catch (cause) {
-      if (requestId === detailRequestRef.current) setDetailError(errorMessage(cause));
-    }
-  };
+      setGeneratedView(generated.view);
+      setGeneratedInventory((inventory) => ({
+        ...inventory,
+        [bundle.bundle.id]: generated.view,
+      }));
+    },
+    [api, commitSelectedArtifact, generatedInventory, indexes],
+  );
+
+  const selectDocument = useCallback(
+    async (document: IndexedMarkdownDocument) => {
+      const requestId = ++detailRequestRef.current;
+      try {
+        setDetailError(null);
+        const detail = await api.getMarkdownDetail(document.rootId, document.id);
+        if (requestId !== detailRequestRef.current) return;
+        commitSelectedMarkdown(detail);
+        if (window.innerWidth <= 960) {
+          setPaneLayout((layout) => ({ ...layout, ledgerCollapsed: true }));
+        }
+      } catch (cause) {
+        if (requestId === detailRequestRef.current) setDetailError(errorMessage(cause));
+      }
+    },
+    [api, commitSelectedMarkdown],
+  );
+
+  useEffect(() => {
+    const selectedId = selectedArtifact?.bundleId ?? selectedMarkdown?.documentId;
+    if (!selectedId || visibleRecords.some((record) => record.id === selectedId)) return;
+    ++detailRequestRef.current;
+    selectedArtifactRef.current = null;
+    setSelectedArtifact(null);
+    setSelectedMarkdown(null);
+    setGeneratedView({ status: "never_generated" });
+    const fallback = visibleRecords[0];
+    if (fallback?.kind === "bundle") void selectBundle(fallback.bundle);
+    if (fallback?.kind === "document") void selectDocument(fallback.document);
+  }, [
+    selectBundle,
+    selectDocument,
+    selectedArtifact?.bundleId,
+    selectedMarkdown?.documentId,
+    visibleRecords,
+  ]);
 
   const changeRegistryScope = (nextScope: RegistryScope) => {
     if (nextScope === registryScope) return;
     setRegistryScope(nextScope);
-    setBundleFilter("all");
+    setBundleFilter("current");
     if (nextScope !== "planning") return;
 
     ++detailRequestRef.current;
@@ -444,16 +780,19 @@ export function App({ api = runtimeApi }: AppProps) {
     const requestedBundleId = selectedArtifact.bundleId;
     const root = indexes.find((index) => index.rootId === selectedArtifact.rootId);
     if (!root) return;
+    const inventoryEpoch = inventoryEpochRef.current;
     const previous = generatedResult(generatedView);
     setGeneratedView({ status: "generating", ...(previous ? { previous } : {}) });
     try {
       const nextView = await api.requestSummary(root.rootId, requestedBundleId);
+      if (inventoryEpoch !== inventoryEpochRef.current) return;
       if (selectedArtifactRef.current?.bundleId === requestedBundleId) setGeneratedView(nextView);
       setGeneratedInventory((inventory) => ({
         ...inventory,
         [requestedBundleId]: nextView,
       }));
     } catch (cause) {
+      if (inventoryEpoch !== inventoryEpochRef.current) return;
       const failed: GeneratedView = {
         status: "failed",
         ...(previous ? { previous } : {}),
@@ -614,7 +953,7 @@ export function App({ api = runtimeApi }: AppProps) {
 
   useEffect(() => () => resizeCleanupRef.current?.(), []);
 
-  const statusLabel = workspaceStatusLabel(status, warnings.length);
+  const statusLabel = workspaceStatusLabel(status, warnings.length + failedPatternRootIds.length);
   const hasSelection = selectedArtifact !== null || selectedMarkdown !== null;
   const ledgerCollapsed = hasSelection && paneLayout.ledgerCollapsed;
   const ledgerToggleLabel = !hasSelection
@@ -625,26 +964,33 @@ export function App({ api = runtimeApi }: AppProps) {
 
   return (
     <main className="app-frame">
-      <header className="titlebar" inert={paletteOpen}>
+      <header
+        className={`titlebar ${appMode === "settings" ? "is-settings" : ""}`}
+        inert={paletteOpen}
+      >
         <div className="wordmark" aria-label="Backstage artifact control tower">
           <img className="brand-mark" src={backstageMark} alt="" />
           <strong>BACKSTAGE</strong>
           <span>Artifact Control Tower</span>
         </div>
         <div className="titlebar-actions">
-          <label className="global-search">
-            <MagnifyingGlassIcon className="app-icon" aria-hidden="true" weight="regular" />
-            <input
-              id="global-search"
-              type="search"
-              value={searchQuery}
-              onChange={(event) => setSearchQuery(event.target.value)}
-              placeholder="Search work"
-              aria-label="Search all indexed work"
-            />
-            <kbd>⌘F</kbd>
-          </label>
-          <span className={`system-state system-state--${status}`}>{statusLabel}</span>
+          {appMode === "work" && (
+            <label className="global-search">
+              <MagnifyingGlassIcon className="app-icon" aria-hidden="true" weight="regular" />
+              <input
+                id="global-search"
+                type="search"
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                placeholder="Search work"
+                aria-label="Search all indexed work"
+              />
+              <kbd>⌘F</kbd>
+            </label>
+          )}
+          {appMode === "work" && (
+            <span className={`system-state system-state--${status}`}>{statusLabel}</span>
+          )}
           <button
             ref={paletteTriggerRef}
             className="icon-button"
@@ -656,344 +1002,382 @@ export function App({ api = runtimeApi }: AppProps) {
             <CommandIcon className="app-icon" aria-hidden="true" weight="regular" />
           </button>
           <button
-            className="icon-button"
+            ref={settingsTriggerRef}
+            className="button button--compact settings-control"
             type="button"
-            onClick={() => void scan(roots)}
-            disabled={roots.length === 0 || status === "scanning"}
-            aria-label="Refresh approved roots"
-            title="Refresh approved roots"
-          >
-            <ArrowClockwiseIcon className="app-icon" aria-hidden="true" weight="regular" />
-          </button>
-          <button
-            className="icon-button ledger-toggle"
-            type="button"
-            aria-pressed={ledgerCollapsed}
-            aria-label={ledgerToggleLabel}
-            title={ledgerToggleLabel}
-            disabled={!hasSelection}
+            aria-pressed={appMode === "settings"}
             onClick={() =>
-              setPaneLayout((layout) => ({ ...layout, ledgerCollapsed: !ledgerCollapsed }))
+              appMode === "settings" ? closeSettings() : openSettings(settingsTriggerRef.current)
             }
           >
-            <SidebarSimpleIcon className="app-icon" aria-hidden="true" weight="regular" />
+            <GearSixIcon className="app-icon" aria-hidden="true" weight="regular" />
+            <span>Settings</span>
           </button>
-          <button
-            className="button button--primary button--compact"
-            type="button"
-            onClick={() => void approveRoot()}
-          >
-            Add root
-          </button>
+          {appMode === "work" && (
+            <button
+              className="icon-button"
+              type="button"
+              onClick={() => void scan(roots)}
+              disabled={roots.length === 0 || status === "scanning"}
+              aria-label="Refresh approved roots"
+              title="Refresh approved roots"
+            >
+              <ArrowClockwiseIcon className="app-icon" aria-hidden="true" weight="regular" />
+            </button>
+          )}
+          {appMode === "work" && (
+            <button
+              className="icon-button ledger-toggle"
+              type="button"
+              aria-pressed={ledgerCollapsed}
+              aria-label={ledgerToggleLabel}
+              title={ledgerToggleLabel}
+              disabled={!hasSelection}
+              onClick={() =>
+                setPaneLayout((layout) => ({ ...layout, ledgerCollapsed: !ledgerCollapsed }))
+              }
+            >
+              <SidebarSimpleIcon className="app-icon" aria-hidden="true" weight="regular" />
+            </button>
+          )}
+          {appMode === "work" && (
+            <button
+              className="button button--primary button--compact"
+              type="button"
+              disabled={settingsBusy}
+              onClick={() => void approveRoot()}
+            >
+              Add root
+            </button>
+          )}
         </div>
       </header>
 
-      <section
-        className={`workspace ${ledgerCollapsed ? "ledger-is-collapsed" : ""}`}
-        aria-label="Artifact workspace"
-        inert={paletteOpen}
-        style={
-          {
-            "--project-width": `${paneLayout.projectWidth}px`,
-            "--ledger-width": `${paneLayout.ledgerWidth}px`,
-          } as CSSProperties
-        }
-      >
-        <aside
-          id="project-registry"
-          className="project-rail"
-          aria-label="Project registry"
-          data-pane="1"
-          tabIndex={0}
+      {appMode === "settings" ? (
+        <SettingsSurface
+          headingRef={settingsHeadingRef}
+          patternInputRef={planningPatternInputRef}
+          roots={roots}
+          indexes={indexes}
+          patterns={patterns}
+          patternRevision={patternRevision}
+          patternsLoading={patternsLoading}
+          settingsBusy={settingsBusy}
+          failedPatternRootIds={failedPatternRootIds}
+          confirmingRootId={confirmingRootId}
+          removingRootId={removingRootId}
+          error={settingsError}
+          notice={settingsNotice}
+          onDone={closeSettings}
+          onAddRoot={approveRoot}
+          onRetry={retryFailedPatternRoots}
+          onConfirmRoot={setConfirmingRootId}
+          onCancelRoot={() => setConfirmingRootId(null)}
+          onRemoveRoot={removeApprovedRoot}
+          onAddPattern={(expression) => applyPatternMutation(() => api.addPattern(expression))}
+          onRemovePattern={(id) => applyPatternMutation(() => api.removePattern(id), true)}
+          onRestoreDefaults={() => applyPatternMutation(() => api.restoreDefaultPatterns())}
+        />
+      ) : (
+        <section
+          className={`workspace ${ledgerCollapsed ? "ledger-is-collapsed" : ""}`}
+          aria-label="Artifact workspace"
+          inert={paletteOpen}
+          style={
+            {
+              "--project-width": `${paneLayout.projectWidth}px`,
+              "--ledger-width": `${paneLayout.ledgerWidth}px`,
+            } as CSSProperties
+          }
         >
-          <div className="pane-heading">
-            <span>Project registry</span>
-            <span className="registry-count">{workProjects.length}</span>
-          </div>
-          <div className="registry-scope" aria-label="Registry scope">
-            <button
-              type="button"
-              aria-pressed={registryScope === "planning"}
-              className={registryScope === "planning" ? "is-selected" : ""}
-              onClick={() => changeRegistryScope("planning")}
-              aria-label="Plan files"
-            >
-              <span className="registry-scope-full">Plan files</span>
-              <span className="registry-scope-compact" aria-hidden="true">
-                Plan
-              </span>
-            </button>
-            <button
-              type="button"
-              aria-pressed={registryScope === "markdown"}
-              className={registryScope === "markdown" ? "is-selected" : ""}
-              onClick={() => changeRegistryScope("markdown")}
-              aria-label="All Markdown"
-            >
-              <span className="registry-scope-full">All Markdown</span>
-              <span className="registry-scope-compact" aria-hidden="true">
-                MD
-              </span>
-            </button>
-          </div>
-          <nav className="project-list" aria-label="Project filters">
-            <button
-              className={`project-row ${selectedProjectId === "all" ? "is-selected" : ""}`}
-              type="button"
-              aria-pressed={selectedProjectId === "all"}
-              aria-label={`All Work, ${workProjects.length} ${workProjects.length === 1 ? "project" : "projects"}`}
-              title="All Work"
-              onClick={() => setSelectedProjectId("all")}
-            >
-              <FilesIcon className="app-icon" aria-hidden="true" weight="regular" />
-              <span className="project-row-copy">
-                <strong>All Work</strong>
-                <small>
-                  {workProjects.length === 0
-                    ? "Awaiting accession"
-                    : `${workProjects.length} ${workProjects.length === 1 ? "project" : "projects"}`}
-                </small>
-              </span>
-              <span className="project-compact-identity" aria-hidden="true">
-                <strong>ALL</strong>
-                <small>{workProjects.length}</small>
-              </span>
-            </button>
-            {workProjects.map((project) => {
-              const fileCount = projectFileCounts.get(project.id) ?? 0;
-              const fileCountLabel =
-                registryScope === "planning"
-                  ? planningFileCountLabel(fileCount)
-                  : markdownFileCountLabel(fileCount);
-              const projectLabel = `${project.name}, ${project.git?.branch ?? "Git unavailable"}, ${fileCountLabel}`;
-              return (
-                <button
-                  className={`project-row ${selectedProjectId === project.id ? "is-selected" : ""}`}
-                  type="button"
-                  key={project.id}
-                  aria-pressed={selectedProjectId === project.id}
-                  aria-label={projectLabel}
-                  title={projectLabel}
-                  onClick={() => setSelectedProjectId(project.id)}
-                >
-                  <FolderSimpleIcon className="app-icon" aria-hidden="true" weight="regular" />
-                  <span className="project-row-copy">
-                    <strong>{project.name}</strong>
-                    <span className="project-row-meta">
-                      <small>{project.git?.branch ?? "Git unavailable"}</small>
-                      <small className="project-file-count">
-                        {fileCount} {fileCount === 1 ? "file" : "files"}
-                      </small>
+          <aside
+            id="project-registry"
+            className="project-rail"
+            aria-label="Project registry"
+            data-pane="1"
+            tabIndex={0}
+          >
+            <div className="pane-heading">
+              <span>Project registry</span>
+              <span className="registry-count">{workProjects.length}</span>
+            </div>
+            <div className="registry-scope" aria-label="Registry scope">
+              <button
+                type="button"
+                aria-pressed={registryScope === "planning"}
+                className={registryScope === "planning" ? "is-selected" : ""}
+                onClick={() => changeRegistryScope("planning")}
+                aria-label="Plan files"
+              >
+                <span className="registry-scope-full">Plan files</span>
+                <span className="registry-scope-compact" aria-hidden="true">
+                  Plan
+                </span>
+              </button>
+              <button
+                type="button"
+                aria-pressed={registryScope === "markdown"}
+                className={registryScope === "markdown" ? "is-selected" : ""}
+                onClick={() => changeRegistryScope("markdown")}
+                aria-label="All Markdown"
+              >
+                <span className="registry-scope-full">All Markdown</span>
+                <span className="registry-scope-compact" aria-hidden="true">
+                  MD
+                </span>
+              </button>
+            </div>
+            <nav className="project-list" aria-label="Project filters">
+              <button
+                className={`project-row ${selectedProjectId === "all" ? "is-selected" : ""}`}
+                type="button"
+                aria-pressed={selectedProjectId === "all"}
+                aria-label={`All Work, ${workProjects.length} ${workProjects.length === 1 ? "project" : "projects"}`}
+                title="All Work"
+                onClick={() => setSelectedProjectId("all")}
+              >
+                <FilesIcon className="app-icon" aria-hidden="true" weight="regular" />
+                <span className="project-row-copy">
+                  <strong>All Work</strong>
+                  <small>
+                    {workProjects.length === 0
+                      ? "Awaiting accession"
+                      : `${workProjects.length} ${workProjects.length === 1 ? "project" : "projects"}`}
+                  </small>
+                </span>
+                <span className="project-compact-identity" aria-hidden="true">
+                  <strong>ALL</strong>
+                  <small>{workProjects.length}</small>
+                </span>
+              </button>
+              {workProjects.map((project) => {
+                const fileCount = projectFileCounts.get(project.id) ?? 0;
+                const fileCountLabel =
+                  registryScope === "planning"
+                    ? planningFileCountLabel(fileCount)
+                    : markdownFileCountLabel(fileCount);
+                const projectLabel = `${project.name}, ${project.git?.branch ?? "Git unavailable"}, ${fileCountLabel}`;
+                return (
+                  <button
+                    className={`project-row ${selectedProjectId === project.id ? "is-selected" : ""}`}
+                    type="button"
+                    key={project.id}
+                    aria-pressed={selectedProjectId === project.id}
+                    aria-label={projectLabel}
+                    title={projectLabel}
+                    onClick={() => setSelectedProjectId(project.id)}
+                  >
+                    <FolderSimpleIcon className="app-icon" aria-hidden="true" weight="regular" />
+                    <span className="project-row-copy">
+                      <strong>{project.name}</strong>
+                      <span className="project-row-meta">
+                        <small>{project.git?.branch ?? "Git unavailable"}</small>
+                        <small className="project-file-count">
+                          {fileCount} {fileCount === 1 ? "file" : "files"}
+                        </small>
+                      </span>
                     </span>
-                  </span>
-                  <span className="project-compact-identity" aria-hidden="true">
-                    <strong>{compactProjectLabel(project.name)}</strong>
-                    <small>{fileCount}</small>
-                  </span>
-                </button>
-              );
-            })}
-          </nav>
-          <div className="root-registry">
-            <span>Approved roots</span>
-            {roots.length === 0 ? (
-              <p>No approved roots</p>
-            ) : (
-              roots.map((root) => <code key={root.id}>{shortPath(root.path)}</code>)
-            )}
-          </div>
-        </aside>
-        <div
-          className="pane-resizer pane-resizer--project"
-          role="separator"
-          aria-label="Resize project registry"
-          aria-orientation="vertical"
-          aria-controls="project-registry"
-          aria-valuemin={PROJECT_WIDTH_MIN}
-          aria-valuemax={PROJECT_WIDTH_MAX}
-          aria-valuenow={paneLayout.projectWidth}
-          aria-valuetext={`${paneLayout.projectWidth} pixels`}
-          tabIndex={0}
-          onKeyDown={(event) => resizePaneFromKeyboard("project", event)}
-          onPointerDown={(event) => startResize("project", event.clientX)}
-        />
+                    <span className="project-compact-identity" aria-hidden="true">
+                      <strong>{compactProjectLabel(project.name)}</strong>
+                      <small>{fileCount}</small>
+                    </span>
+                  </button>
+                );
+              })}
+            </nav>
+          </aside>
+          <div
+            className="pane-resizer pane-resizer--project"
+            role="separator"
+            aria-label="Resize project registry"
+            aria-orientation="vertical"
+            aria-controls="project-registry"
+            aria-valuemin={PROJECT_WIDTH_MIN}
+            aria-valuemax={PROJECT_WIDTH_MAX}
+            aria-valuenow={paneLayout.projectWidth}
+            aria-valuetext={`${paneLayout.projectWidth} pixels`}
+            tabIndex={0}
+            onKeyDown={(event) => resizePaneFromKeyboard("project", event)}
+            onPointerDown={(event) => startResize("project", event.clientX)}
+          />
 
-        <section
-          id="bundle-ledger"
-          className="bundle-ledger"
-          aria-label="Bundle ledger"
-          data-pane="2"
-          tabIndex={0}
-        >
-          <div className="ledger-toolbar">
-            <div>
-              <span className="pane-heading-label">
-                {registryScope === "planning" ? "Bundle ledger" : "Markdown ledger"}
+          <section
+            id="bundle-ledger"
+            className="bundle-ledger"
+            aria-label="Bundle ledger"
+            data-pane="2"
+            tabIndex={0}
+          >
+            <div className="ledger-toolbar">
+              <div>
+                <span className="pane-heading-label">
+                  {registryScope === "planning" ? "Bundle ledger" : "Markdown ledger"}
+                </span>
+                <strong>
+                  {selectedProjectId === "all" ? "All Work" : filteredProjects[0]?.name}
+                </strong>
+              </div>
+              <span className="ledger-count">
+                <span>
+                  {visibleRecordCount} {visibleRecordCount === 1 ? "record" : "records"}
+                </span>
+                <span aria-hidden="true">·</span>
+                <span>
+                  {visibleFileCount} {visibleFileCount === 1 ? "file" : "files"}
+                </span>
               </span>
-              <strong>
-                {selectedProjectId === "all" ? "All Work" : filteredProjects[0]?.name}
-              </strong>
             </div>
-            <span className="ledger-count">
-              <span>
-                {visibleRecordCount} {visibleRecordCount === 1 ? "record" : "records"}
-              </span>
-              <span aria-hidden="true">·</span>
-              <span>
-                {visibleFileCount} {visibleFileCount === 1 ? "file" : "files"}
-              </span>
-            </span>
-          </div>
-          <div className="ledger-filters" aria-label="Deterministic state filters">
-            {registryScope === "markdown" && (
-              <span className="ledger-filter-label">Planning filters</span>
-            )}
-            <button
-              type="button"
-              className={bundleFilter === "all" ? "is-selected" : ""}
-              aria-pressed={bundleFilter === "all"}
-              onClick={() => setBundleFilter("all")}
-            >
-              All
-            </button>
-            <button
-              type="button"
-              className={bundleFilter === "unfinished" ? "is-selected" : ""}
-              aria-pressed={bundleFilter === "unfinished"}
-              onClick={() => setBundleFilter("unfinished")}
-            >
-              Unfinished
-            </button>
-            <button
-              type="button"
-              className={bundleFilter === "warning" ? "is-selected" : ""}
-              aria-pressed={bundleFilter === "warning"}
-              onClick={() => setBundleFilter("warning")}
-            >
-              Warning-bearing
-            </button>
-            <button
-              type="button"
-              aria-pressed={bundleFilter === "stale"}
-              className={bundleFilter === "stale" ? "is-selected" : ""}
-              onClick={() => setBundleFilter("stale")}
-            >
-              Stale
-            </button>
-            <button
-              type="button"
-              aria-pressed={bundleFilter === "recent"}
-              className={bundleFilter === "recent" ? "is-selected" : ""}
-              onClick={() => setBundleFilter("recent")}
-            >
-              Recently changed
-            </button>
-          </div>
-          {status === "loading" && indexes.length === 0 ? (
-            <ScanSkeleton />
-          ) : visibleRecordCount > 0 ? (
-            <div className="bundle-list">
-              {status === "scanning" && (
-                <p className="refresh-indicator" role="status">
-                  Refreshing in the background · prior index remains usable
-                </p>
+            <div className="ledger-filters" aria-label="Deterministic state filters">
+              {registryScope === "markdown" && (
+                <span className="ledger-filter-label">Planning filters</span>
               )}
-              {displayedBundles.map((bundle) => (
-                <BundleRow
-                  key={bundle.bundle.id}
-                  bundle={bundle}
-                  selected={selectedArtifact?.bundleId === bundle.bundle.id}
-                  onSelect={() => void selectBundle(bundle)}
-                />
-              ))}
-              {displayedDocuments.map((document) => (
-                <DocumentRow
-                  key={document.id}
-                  document={document}
-                  selected={selectedMarkdown?.documentId === document.id}
-                  onSelect={() => void selectDocument(document)}
-                />
-              ))}
-              {remainingRecordCount > 0 && (
+              {(
+                [
+                  ["current", "Current"],
+                  ["active", "Active"],
+                  ["done", "Done"],
+                  ["archived", "Archived"],
+                  ["warning", "Warning-bearing"],
+                  ["stale", "Stale"],
+                ] as const
+              ).map(([filter, label]) => (
                 <button
-                  className="ledger-load-more"
+                  key={filter}
                   type="button"
-                  onClick={() => setLedgerLimit((limit) => limit + LEDGER_BATCH_SIZE)}
+                  className={bundleFilter === filter ? "is-selected" : ""}
+                  aria-pressed={bundleFilter === filter}
+                  onClick={() => {
+                    ++detailRequestRef.current;
+                    setBundleFilter(filter);
+                  }}
                 >
-                  Show {Math.min(LEDGER_BATCH_SIZE, remainingRecordCount)} more records
+                  {label}
                 </button>
-              )}
+              ))}
             </div>
-          ) : (
-            <div className="ledger-empty">
-              <ArchiveIcon className="app-icon" aria-hidden="true" weight="regular" />
-              <strong>{workProjects.length === 0 ? "No entries yet" : "No records match"}</strong>
-              <p>
-                {workProjects.length === 0
-                  ? "Approve or refresh a root to populate this ledger."
-                  : "Change the deterministic filter or refresh the approved root."}
-              </p>
-            </div>
-          )}
-        </section>
-        <div
-          className="pane-resizer pane-resizer--ledger"
-          role="separator"
-          aria-label="Resize bundle ledger"
-          aria-orientation="vertical"
-          aria-controls="bundle-ledger"
-          aria-valuemin={LEDGER_WIDTH_MIN}
-          aria-valuemax={LEDGER_WIDTH_MAX}
-          aria-valuenow={paneLayout.ledgerWidth}
-          aria-valuetext={`${paneLayout.ledgerWidth} pixels`}
-          tabIndex={0}
-          onKeyDown={(event) => resizePaneFromKeyboard("ledger", event)}
-          onPointerDown={(event) => startResize("ledger", event.clientX)}
-        />
+            {status === "loading" && indexes.length === 0 ? (
+              <ScanSkeleton />
+            ) : visibleRecordCount > 0 ? (
+              <div className="bundle-list">
+                {status === "scanning" && (
+                  <p className="refresh-indicator" role="status">
+                    Refreshing in the background · prior index remains usable
+                  </p>
+                )}
+                {displayedGroups.map((group) => (
+                  <section
+                    className="ledger-group"
+                    aria-labelledby={`ledger-group-${slug(group.label)}`}
+                    key={group.label}
+                  >
+                    <h2 id={`ledger-group-${slug(group.label)}`}>{group.label}</h2>
+                    {group.records.map((record) =>
+                      record.kind === "bundle" ? (
+                        <BundleRow
+                          key={record.id}
+                          bundle={record.bundle}
+                          now={currentTime}
+                          selected={selectedArtifact?.bundleId === record.bundle.bundle.id}
+                          onSelect={() => void selectBundle(record.bundle)}
+                          onNavigate={navigateLedgerRows}
+                        />
+                      ) : (
+                        <DocumentRow
+                          key={record.id}
+                          document={record.document}
+                          now={currentTime}
+                          selected={selectedMarkdown?.documentId === record.document.id}
+                          onSelect={() => void selectDocument(record.document)}
+                          onNavigate={navigateLedgerRows}
+                        />
+                      ),
+                    )}
+                  </section>
+                ))}
+                {remainingRecordCount > 0 && (
+                  <button
+                    className="ledger-load-more"
+                    type="button"
+                    onClick={() => setLedgerLimit((limit) => limit + LEDGER_BATCH_SIZE)}
+                  >
+                    Show {Math.min(LEDGER_BATCH_SIZE, remainingRecordCount)} more records
+                  </button>
+                )}
+              </div>
+            ) : (
+              <div className="ledger-empty">
+                <ArchiveIcon className="app-icon" aria-hidden="true" weight="regular" />
+                <strong>{workProjects.length === 0 ? "No entries yet" : "No records match"}</strong>
+                <p>
+                  {workProjects.length === 0
+                    ? "Approve or refresh a root to populate this ledger."
+                    : "Change the deterministic filter or refresh the approved root."}
+                </p>
+              </div>
+            )}
+          </section>
+          <div
+            className="pane-resizer pane-resizer--ledger"
+            role="separator"
+            aria-label="Resize bundle ledger"
+            aria-orientation="vertical"
+            aria-controls="bundle-ledger"
+            aria-valuemin={LEDGER_WIDTH_MIN}
+            aria-valuemax={LEDGER_WIDTH_MAX}
+            aria-valuenow={paneLayout.ledgerWidth}
+            aria-valuetext={`${paneLayout.ledgerWidth} pixels`}
+            tabIndex={0}
+            onKeyDown={(event) => resizePaneFromKeyboard("ledger", event)}
+            onPointerDown={(event) => startResize("ledger", event.clientX)}
+          />
 
-        <section
-          ref={readingDeskRef}
-          className="reading-desk"
-          aria-label="Reading desk"
-          data-pane="3"
-          tabIndex={0}
-        >
-          {selectedArtifact ? (
-            <ArtifactReadingDesk
-              detail={selectedArtifact}
-              generatedView={generatedView}
-              onSelectMember={selectArtifactMember}
-              onRequestSummary={requestSummary}
-              onCopyPath={() => runHandoff("path")}
-              onCopyPrompt={() => runHandoff("prompt")}
-              onOpenTerminal={() => runHandoff("terminal")}
-            />
-          ) : selectedMarkdown ? (
-            <MarkdownReadingDesk detail={selectedMarkdown} onCopyPath={copyMarkdownPath} />
-          ) : (
-            <WorkspaceContent
-              status={status}
-              roots={roots}
-              projects={filteredProjects}
-              scope={registryScope}
-              warnings={warnings}
-              error={error}
-              onApprove={approveRoot}
-              onRefresh={() => scan(roots)}
-            />
-          )}
-          {handoffNotice && (
-            <p className="handoff-notice" role="status">
-              {handoffNotice}
-            </p>
-          )}
-          {detailError && (
-            <p className="detail-error" role="alert">
-              {detailError}
-            </p>
-          )}
+          <section
+            ref={readingDeskRef}
+            className="reading-desk"
+            aria-label="Reading desk"
+            data-pane="3"
+            tabIndex={0}
+          >
+            {selectedArtifact ? (
+              <ArtifactReadingDesk
+                detail={selectedArtifact}
+                generatedView={generatedView}
+                onSelectMember={selectArtifactMember}
+                onRequestSummary={requestSummary}
+                onCopyPath={() => runHandoff("path")}
+                onCopyPrompt={() => runHandoff("prompt")}
+                onOpenTerminal={() => runHandoff("terminal")}
+              />
+            ) : selectedMarkdown ? (
+              <MarkdownReadingDesk detail={selectedMarkdown} onCopyPath={copyMarkdownPath} />
+            ) : (
+              <WorkspaceContent
+                status={status}
+                roots={roots}
+                projects={filteredProjects}
+                scope={registryScope}
+                warnings={warnings}
+                error={error}
+                settingsBusy={settingsBusy}
+                onApprove={approveRoot}
+                onRefresh={async () => {
+                  await scan(roots);
+                }}
+              />
+            )}
+            {handoffNotice && (
+              <p className="handoff-notice" role="status">
+                {handoffNotice}
+              </p>
+            )}
+            {detailError && (
+              <p className="detail-error" role="alert">
+                {detailError}
+              </p>
+            )}
+          </section>
         </section>
-      </section>
+      )}
       {paletteOpen && (
         <CommandPalette
           inputRef={paletteInputRef}
@@ -1002,14 +1386,345 @@ export function App({ api = runtimeApi }: AppProps) {
           onClose={closePalette}
           onRefresh={() => void scan(roots)}
           onApprove={() => void approveRoot()}
+          onOpenSettings={() => openSettings(paletteTriggerRef.current)}
           onToggleLedger={() =>
             setPaneLayout((layout) => ({ ...layout, ledgerCollapsed: !ledgerCollapsed }))
           }
+          canApprove={!settingsBusy}
           canToggleLedger={hasSelection}
           canRefresh={roots.length > 0 && status !== "scanning"}
         />
       )}
     </main>
+  );
+}
+
+function SettingsSurface({
+  headingRef,
+  patternInputRef,
+  roots,
+  indexes,
+  patterns,
+  patternRevision,
+  patternsLoading,
+  settingsBusy,
+  failedPatternRootIds,
+  confirmingRootId,
+  removingRootId,
+  error,
+  notice,
+  onDone,
+  onAddRoot,
+  onRetry,
+  onConfirmRoot,
+  onCancelRoot,
+  onRemoveRoot,
+  onAddPattern,
+  onRemovePattern,
+  onRestoreDefaults,
+}: {
+  headingRef: RefObject<HTMLHeadingElement | null>;
+  patternInputRef: RefObject<HTMLInputElement | null>;
+  roots: ApprovedRoot[];
+  indexes: IndexSnapshot[];
+  patterns: PlanningPattern[];
+  patternRevision: number;
+  patternsLoading: boolean;
+  settingsBusy: boolean;
+  failedPatternRootIds: string[];
+  confirmingRootId: string | null;
+  removingRootId: string | null;
+  error: string | null;
+  notice: string | null;
+  onDone: () => void;
+  onAddRoot: () => Promise<void>;
+  onRetry: () => Promise<void>;
+  onConfirmRoot: (rootId: string) => void;
+  onCancelRoot: () => void;
+  onRemoveRoot: (rootId: string) => Promise<void>;
+  onAddPattern: (expression: string) => Promise<void>;
+  onRemovePattern: (id: string) => Promise<void>;
+  onRestoreDefaults: () => Promise<void>;
+}) {
+  const [expression, setExpression] = useState("");
+  return (
+    <section className="settings-surface" aria-labelledby="settings-heading">
+      <header className="settings-heading">
+        <div>
+          <h1 id="settings-heading" ref={headingRef} tabIndex={-1}>
+            Settings
+          </h1>
+          <p>Manage app-owned approvals and planning conventions. Repositories remain read-only.</p>
+        </div>
+        <button className="button button--primary" type="button" onClick={onDone}>
+          Done
+        </button>
+      </header>
+
+      {error && (
+        <p className="settings-feedback settings-feedback--error" role="alert">
+          {error} Try the action again; existing roots and indexes remain available.
+        </p>
+      )}
+      {notice && (
+        <p className="settings-feedback settings-feedback--notice" role="status">
+          {notice}
+        </p>
+      )}
+
+      <section className="settings-section" aria-labelledby="approved-roots-heading">
+        <header>
+          <div>
+            <h2 id="approved-roots-heading">Approved roots</h2>
+            <p>Backstage scans only these folders and keeps indexes in app-owned storage.</p>
+          </div>
+          <button
+            className="button button--primary"
+            type="button"
+            disabled={settingsBusy}
+            onClick={() => void onAddRoot()}
+          >
+            Add root
+          </button>
+        </header>
+        {roots.length === 0 ? (
+          <div className="settings-empty">
+            <strong>No folders are being scanned.</strong>
+            <p>Add a root to discover local planning work without changing repository files.</p>
+          </div>
+        ) : (
+          <ul className="settings-register root-register">
+            {roots.map((root) => (
+              <ApprovedRootRow
+                key={root.id}
+                root={root}
+                index={indexes.find((candidate) => candidate.rootId === root.id)}
+                failed={failedPatternRootIds.includes(root.id)}
+                confirming={confirmingRootId === root.id}
+                rootBusy={settingsBusy}
+                removing={removingRootId === root.id}
+                onRetry={onRetry}
+                onConfirm={() => onConfirmRoot(root.id)}
+                onCancel={onCancelRoot}
+                onRemove={() => onRemoveRoot(root.id)}
+              />
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="settings-section" aria-labelledby="planning-patterns-heading">
+        <header>
+          <div>
+            <h2 id="planning-patterns-heading">Planning patterns</h2>
+            <p>
+              Rust-compatible regular expressions match normalized project-relative Markdown paths.
+              Valid broad patterns are allowed and may classify every in-scope Markdown file as
+              planning work.
+            </p>
+          </div>
+          <button
+            className="button"
+            type="button"
+            disabled={settingsBusy}
+            onClick={() => void onRestoreDefaults()}
+          >
+            Restore defaults
+          </button>
+        </header>
+        <form
+          className="pattern-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void onAddPattern(expression);
+          }}
+        >
+          <label htmlFor="planning-pattern-expression">Regular expression</label>
+          <div>
+            <input
+              ref={patternInputRef}
+              id="planning-pattern-expression"
+              value={expression}
+              onChange={(event) => setExpression(event.target.value)}
+              placeholder="^docs/plans/.*\\.md$"
+              disabled={settingsBusy}
+            />
+            <button
+              className="button button--primary"
+              type="submit"
+              disabled={settingsBusy || expression.length === 0}
+            >
+              {settingsBusy ? "Settings busy…" : "Add pattern"}
+            </button>
+          </div>
+          <small>
+            Configuration revision {patternRevision}. This changes app-owned configuration and
+            indexes only; it never writes matching repositories.
+          </small>
+        </form>
+        {failedPatternRootIds.length > 0 && (
+          <p className="settings-feedback settings-feedback--warning" role="alert">
+            {failedPatternRootIds.length} approved{" "}
+            {failedPatternRootIds.length === 1 ? "root" : "roots"} could not be rescanned. The last
+            successful index remains available; retry Refresh.
+          </p>
+        )}
+        {patternsLoading ? (
+          <div className="settings-empty" aria-live="polite">
+            <strong>Loading planning patterns…</strong>
+          </div>
+        ) : patterns.length === 0 ? (
+          <div className="settings-empty">
+            <strong>No planning patterns configured.</strong>
+            <p>OpenSpec recognition and All Markdown indexing continue independently.</p>
+          </div>
+        ) : (
+          <ul className="settings-register pattern-register">
+            {[...patterns]
+              .sort(
+                (left, right) => left.ordinal - right.ordinal || left.id.localeCompare(right.id),
+              )
+              .map((pattern) => (
+                <li key={pattern.id}>
+                  <div className="settings-row">
+                    <div className="settings-row-copy">
+                      <code title={pattern.expression}>{pattern.expression}</code>
+                      <span>{pattern.provenance === "default" ? "Default" : "Custom"}</span>
+                    </div>
+                    <button
+                      className="button"
+                      type="button"
+                      disabled={settingsBusy}
+                      onClick={() => void onRemovePattern(pattern.id)}
+                    >
+                      Remove
+                    </button>
+                  </div>
+                </li>
+              ))}
+          </ul>
+        )}
+      </section>
+    </section>
+  );
+}
+
+function ApprovedRootRow({
+  root,
+  index,
+  failed,
+  confirming,
+  rootBusy,
+  removing,
+  onRetry,
+  onConfirm,
+  onCancel,
+  onRemove,
+}: {
+  root: ApprovedRoot;
+  index: IndexSnapshot | undefined;
+  failed: boolean;
+  confirming: boolean;
+  rootBusy: boolean;
+  removing: boolean;
+  onRetry: () => Promise<void>;
+  onConfirm: () => void;
+  onCancel: () => void;
+  onRemove: () => Promise<void>;
+}) {
+  const removeTriggerRef = useRef<HTMLButtonElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const projectCount = index?.projects.length ?? 0;
+
+  useEffect(() => {
+    if (confirming) cancelRef.current?.focus();
+  }, [confirming]);
+
+  const cancel = () => {
+    onCancel();
+    removeTriggerRef.current?.focus();
+  };
+
+  return (
+    <li>
+      <div className="settings-row">
+        <div className="settings-row-copy">
+          <code title={root.path} aria-label={`Approved root ${root.path}`}>
+            {root.path}
+          </code>
+          <span>
+            {failed
+              ? "Rescan failed · last successful index retained"
+              : index
+                ? `${projectCount} ${projectCount === 1 ? "project" : "projects"} indexed · revision ${index.configurationRevision}`
+                : "Index unavailable · retry scan"}
+          </span>
+        </div>
+        <div className="settings-row-actions">
+          {(failed || !index) && (
+            <button
+              className="button"
+              type="button"
+              disabled={rootBusy}
+              onClick={() => void onRetry()}
+            >
+              Retry
+            </button>
+          )}
+          <button
+            ref={removeTriggerRef}
+            className="button"
+            type="button"
+            disabled={rootBusy}
+            onClick={onConfirm}
+          >
+            {removing ? "Removing…" : "Remove"}
+          </button>
+        </div>
+      </div>
+      {confirming && (
+        <section
+          className="removal-confirmation"
+          role="alertdialog"
+          aria-labelledby={`remove-root-${root.id}`}
+          onKeyDown={(event) => {
+            if (event.key !== "Escape" || rootBusy) return;
+            event.preventDefault();
+            event.stopPropagation();
+            cancel();
+          }}
+        >
+          <div>
+            <h3 id={`remove-root-${root.id}`} tabIndex={-1}>
+              Remove approved root?
+            </h3>
+            <p>
+              Backstage forgets approval, index, and unreachable generated summaries. Repository
+              files remain untouched.
+            </p>
+          </div>
+          <div className="button-row">
+            <button
+              ref={cancelRef}
+              className="button"
+              type="button"
+              disabled={rootBusy}
+              onClick={cancel}
+            >
+              Cancel
+            </button>
+            <button
+              className="button button--primary"
+              type="button"
+              disabled={rootBusy}
+              onClick={() => void onRemove()}
+            >
+              Remove approval
+            </button>
+          </div>
+        </section>
+      )}
+    </li>
   );
 }
 
@@ -1020,6 +1735,7 @@ interface WorkspaceContentProps {
   scope: RegistryScope;
   warnings: ScanWarning[];
   error: string | null;
+  settingsBusy: boolean;
   onApprove: () => Promise<void>;
   onRefresh: () => Promise<void>;
 }
@@ -1031,6 +1747,7 @@ function WorkspaceContent({
   scope,
   warnings,
   error,
+  settingsBusy,
   onApprove,
   onRefresh,
 }: WorkspaceContentProps) {
@@ -1059,7 +1776,12 @@ function WorkspaceContent({
             Approve a parent folder. Backstage will find Git projects and durable planning work
             beneath it without writing inside any repository.
           </p>
-          <button className="button button--primary" type="button" onClick={() => void onApprove()}>
+          <button
+            className="button button--primary"
+            type="button"
+            disabled={settingsBusy}
+            onClick={() => void onApprove()}
+          >
             Approve a root
           </button>
           {error && (
@@ -1161,7 +1883,9 @@ function CommandPalette({
   onClose,
   onRefresh,
   onApprove,
+  onOpenSettings,
   onToggleLedger,
+  canApprove,
   canToggleLedger,
   canRefresh,
 }: {
@@ -1171,7 +1895,9 @@ function CommandPalette({
   onClose: (restoreFocus?: boolean) => void;
   onRefresh: () => void;
   onApprove: () => void;
+  onOpenSettings: () => void;
   onToggleLedger: () => void;
+  canApprove: boolean;
   canToggleLedger: boolean;
   canRefresh: boolean;
 }) {
@@ -1183,7 +1909,8 @@ function CommandPalette({
       run: () => document.getElementById("global-search")?.focus(),
     },
     { label: "Refresh approved roots", hint: "⌘R", disabled: !canRefresh, run: onRefresh },
-    { label: "Approve another root", hint: "", disabled: false, run: onApprove },
+    { label: "Approve another root", hint: "", disabled: !canApprove, run: onApprove },
+    { label: "Open Settings", hint: "", disabled: false, run: onOpenSettings },
     {
       label: "Toggle bundle ledger",
       hint: "",
@@ -1243,7 +1970,9 @@ function CommandPalette({
               type="button"
               disabled={command.disabled}
               onClick={() => {
-                onClose(command.label !== "Search indexed work");
+                onClose(
+                  command.label !== "Search indexed work" && command.label !== "Open Settings",
+                );
                 if (command.label === "Search indexed work") {
                   requestAnimationFrame(command.run);
                 } else {
@@ -1335,6 +2064,8 @@ function ArtifactReadingDesk({
   const progress = detail.progress.status === "available" ? detail.progress.progress : null;
   const isStructuredOpenSpec =
     detail.bundleKind === "open_spec_change" && detail.openSpecView !== null && detail.openSpecView;
+  const primaryStatus =
+    detail.bundleKind === "open_spec_change" ? detailPrimaryStatus(detail) : null;
   const rendered = useMemo(() => renderMarkdown(detail.markdown), [detail.markdown]);
   const renderedOverview = useMemo(
     () =>
@@ -1356,12 +2087,13 @@ function ArtifactReadingDesk({
         <h1>{detail.bundleName}</h1>
         {isStructuredOpenSpec ? (
           <p className="artifact-context">
+            <span className="artifact-lifecycle">{primaryStatusLabel(primaryStatus!)}</span>
             <span>{detail.projectName}</span>
             <span>{detail.git ? detail.git.branch : "Git unavailable"}</span>
             <span>
               {progress
-                ? `${progress.completed}/${progress.total} tasks complete`
-                : "Task facts unavailable"}
+                ? `${progress.remainingCount} open · ${progress.completed} done`
+                : "Progress unavailable"}
             </span>
           </p>
         ) : (
@@ -1387,7 +2119,9 @@ function ArtifactReadingDesk({
                 {mode === "overview"
                   ? "Overview"
                   : mode === "tasks"
-                    ? `Tasks ${progress?.total ?? 0}`
+                    ? progress
+                      ? `Tasks ${progress.total}`
+                      : "Tasks"
                     : "Source"}
               </button>
             ))}
@@ -1771,10 +2505,18 @@ function GeneratedSummary({
         <span className="generated-status">{generatedStatusLabel(view)}</span>
       </div>
       {view.status === "never_generated" && (
-        <p>
-          No repository content has been sent to Pi. Generate only when you want a bounded snapshot
-          explained.
-        </p>
+        <>
+          <p>
+            No repository content has been sent to Pi. Generate only when you want a bounded
+            snapshot explained.
+          </p>
+          {view.capabilityReason && (
+            <p className="generated-failure">
+              {view.capabilityReason}. Artifact detail remains available; retry generation when the
+              service recovers.
+            </p>
+          )}
+        </>
       )}
       {view.status === "stale" && (
         <p>
@@ -1853,74 +2595,104 @@ function generatedStatusLabel(view: GeneratedView) {
 
 function DocumentRow({
   document,
+  now,
   selected,
   onSelect,
+  onNavigate,
 }: {
   document: IndexedMarkdownDocument;
+  now: Date;
   selected: boolean;
   onSelect: () => void;
+  onNavigate: (event: ReactKeyboardEvent<HTMLButtonElement>) => void;
 }) {
+  const sourceDate = formatLedgerDate(document.sourceModifiedUnixNanos, now);
   return (
     <button
       className={`bundle-row document-row ${selected ? "is-selected" : ""}`}
       type="button"
+      data-ledger-row="true"
       aria-pressed={selected}
       onClick={onSelect}
+      onKeyDown={onNavigate}
     >
       <span className="bundle-row-top">
         <span className="bundle-kind bundle-kind--markdown">Markdown document</span>
       </span>
       <strong>{fileLabel(document.relativePath)}</strong>
-      <small>{document.projectName}</small>
-      <span className="bundle-progress">
-        {document.relativePath}
-        {document.sourceModifiedUnixNanos
-          ? ` · changed ${formatSourceDate(document.sourceModifiedUnixNanos)}`
-          : ""}
+      <span className="bundle-primary-meta">
+        <span className="bundle-provenance">{document.projectName}</span>
+        <time dateTime={sourceDate.dateTime} aria-label={sourceDate.full} title={sourceDate.full}>
+          {sourceDate.concise}
+        </time>
       </span>
+      <small className="bundle-path">{document.relativePath}</small>
     </button>
   );
 }
 
 function BundleRow({
   bundle,
+  now,
   selected,
   onSelect,
+  onNavigate,
 }: {
   bundle: IndexedBundle;
+  now: Date;
   selected: boolean;
   onSelect: () => void;
+  onNavigate: (event: ReactKeyboardEvent<HTMLButtonElement>) => void;
 }) {
   const progress = bundle.progress.status === "available" ? bundle.progress.progress : null;
   const warningCount = bundle.warnings.length + bundle.progress.progress.warnings.length;
-  const label = bundle.bundle.kind === "open_spec_change" ? "OpenSpec" : "Planning candidate";
+  const isOpenSpec = bundle.bundle.kind === "open_spec_change";
+  const label = isOpenSpec ? "OpenSpec" : "Planning candidate";
+  const status = isOpenSpec ? bundlePrimaryStatus(bundle) : null;
+  const sourceDate = formatLedgerDate(bundle.sourceModifiedUnixNanos, now);
   return (
     <button
       className={`bundle-row ${selected ? "is-selected" : ""}`}
       type="button"
+      data-ledger-row="true"
       aria-pressed={selected}
       onClick={onSelect}
+      onKeyDown={onNavigate}
     >
       <span className="bundle-row-top">
         <span className={`bundle-kind bundle-kind--${bundle.bundle.kind}`}>{label}</span>
-        {warningCount > 0 && <span className="bundle-warning">{warningCount} warning</span>}
+        {warningCount > 0 && (
+          <span className="bundle-warning">
+            {warningCount} {warningCount === 1 ? "warning" : "warnings"}
+          </span>
+        )}
       </span>
       <strong>{bundle.bundle.name}</strong>
-      <small>{bundle.bundle.projectName}</small>
-      <span className="bundle-progress">
-        {bundle.bundle.kind === "possible_artifact"
-          ? candidateEvidenceLabel(
-              bundle.bundle.recognition.status === "possible"
-                ? bundle.bundle.recognition.reason
-                : undefined,
-            )
-          : progress
-            ? `${progress.completed}/${progress.total} tasks complete`
-            : "Progress unavailable"}
-        {bundle.sourceModifiedUnixNanos
-          ? ` · changed ${formatSourceDate(bundle.sourceModifiedUnixNanos)}`
-          : ""}
+      <span className="bundle-primary-meta">
+        <span>
+          {status && <strong className="bundle-lifecycle">{primaryStatusLabel(status)}</strong>}
+          {isOpenSpec && (
+            <span className="bundle-task-counts">
+              {progress
+                ? `${progress.remainingCount} open · ${progress.completed} done`
+                : "Progress unavailable"}
+            </span>
+          )}
+          {!isOpenSpec && (
+            <span className="bundle-provenance">
+              {candidateEvidenceLabel(
+                bundle.bundle.recognition.status === "possible"
+                  ? bundle.bundle.recognition.reason
+                  : undefined,
+              )}
+            </span>
+          )}
+        </span>
+        <time dateTime={sourceDate.dateTime} aria-label={sourceDate.full} title={sourceDate.full}>
+          {sourceDate.concise}
+        </time>
       </span>
+      <small>{bundle.bundle.projectName}</small>
     </button>
   );
 }
@@ -1978,19 +2750,87 @@ function compactProjectLabel(name: string) {
   return name.slice(0, 3).toUpperCase();
 }
 
-function recentBundles(bundles: IndexedBundle[]) {
-  const latest = Math.max(...bundles.map((bundle) => bundle.sourceModifiedUnixNanos ?? 0), 0);
-  if (!latest) return [];
-  const sevenDaysInNanos = 7 * 24 * 60 * 60 * 1_000_000_000;
-  return bundles
-    .filter(
-      (bundle) =>
-        bundle.sourceModifiedUnixNanos !== null &&
-        latest - bundle.sourceModifiedUnixNanos <= sevenDaysInNanos,
-    )
-    .sort(
-      (left, right) => (right.sourceModifiedUnixNanos ?? 0) - (left.sourceModifiedUnixNanos ?? 0),
-    );
+function bundlePrimaryStatus(bundle: IndexedBundle): OpenSpecPrimaryStatus {
+  if (bundle.primaryStatus) return bundle.primaryStatus;
+  if (bundle.bundle.custody?.status === "archived") return "archived";
+  return bundle.progress.status === "available" && bundle.progress.progress.remainingCount === 0
+    ? "done"
+    : "active";
+}
+
+function detailPrimaryStatus(detail: ArtifactDetail): OpenSpecPrimaryStatus {
+  if (detail.primaryStatus) return detail.primaryStatus;
+  if (detail.custody?.status === "archived") return "archived";
+  return detail.progress.status === "available" && detail.progress.progress.remainingCount === 0
+    ? "done"
+    : "active";
+}
+
+function primaryStatusLabel(status: OpenSpecPrimaryStatus) {
+  return status[0]!.toUpperCase() + status.slice(1);
+}
+
+function bundleMatchesFilter(
+  bundle: IndexedBundle,
+  filter: BundleFilter,
+  generatedInventory: Record<string, GeneratedView>,
+) {
+  const isOpenSpec = bundle.bundle.kind === "open_spec_change";
+  const status = isOpenSpec ? bundlePrimaryStatus(bundle) : null;
+  switch (filter) {
+    case "current":
+      return status !== "archived";
+    case "active":
+      return status === "active";
+    case "done":
+      return status === "done";
+    case "archived":
+      return status === "archived";
+    case "warning":
+      return bundle.warnings.length > 0 || bundle.progress.progress.warnings.length > 0;
+    case "stale":
+      return generatedInventory[bundle.bundle.id]?.status === "stale";
+  }
+}
+
+function formatLedgerDate(unixNanos: SourceTimestamp, now: Date) {
+  const milliseconds = validSourceMilliseconds(unixNanos);
+  if (milliseconds === null) {
+    return { concise: "Date unavailable", full: "Source date unavailable", dateTime: undefined };
+  }
+  const date = new Date(milliseconds);
+  return {
+    concise: date.toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      year: date.getFullYear() === now.getFullYear() ? undefined : "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    }),
+    full: date.toLocaleString(undefined, { dateStyle: "full", timeStyle: "short" }),
+    dateTime: date.toISOString(),
+  };
+}
+
+function navigateLedgerRows(event: ReactKeyboardEvent<HTMLButtonElement>) {
+  if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+  const rows = Array.from(document.querySelectorAll<HTMLButtonElement>('[data-ledger-row="true"]'));
+  const current = rows.indexOf(event.currentTarget);
+  const next =
+    event.key === "Home"
+      ? rows[0]
+      : event.key === "End"
+        ? rows.at(-1)
+        : event.key === "ArrowDown"
+          ? rows[current + 1]
+          : rows[current - 1];
+  if (!next) return;
+  event.preventDefault();
+  next.focus();
+}
+
+function slug(value: string) {
+  return value.toLowerCase().replaceAll(" ", "-");
 }
 
 function fileLabel(path: string) {
@@ -2001,21 +2841,17 @@ function fileLabel(path: string) {
   return parts.at(-1) ?? path;
 }
 
-function formatSourceDate(unixNanos: number | null) {
-  if (!unixNanos) return "Source date unavailable";
-  const date = new Date(unixNanos / 1_000_000);
-  return Number.isNaN(date.valueOf()) ? "Source date unavailable" : date.toLocaleString();
+function formatSourceDate(unixNanos: SourceTimestamp) {
+  const milliseconds = validSourceMilliseconds(unixNanos);
+  return milliseconds === null
+    ? "Source date unavailable"
+    : new Date(milliseconds).toLocaleString();
 }
 
 function shortFingerprint(fingerprint: string) {
   return fingerprint.length > 22
     ? `${fingerprint.slice(0, 16)}…${fingerprint.slice(-6)}`
     : fingerprint;
-}
-
-function shortPath(path: string) {
-  const parts = path.split("/").filter(Boolean);
-  return parts.length > 3 ? `…/${parts.slice(-3).join("/")}` : path;
 }
 
 function workspaceStatusLabel(status: WorkspaceStatus, warningCount: number) {

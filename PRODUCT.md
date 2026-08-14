@@ -19,10 +19,13 @@ Backstage is a read-only macOS app for local planning files.
 You can use it to:
 
 - Find planning work across approved local folders.
-- Read an OpenSpec change as an overview, task list, or exact source.
+- Add and remove approved folders from an app-owned Settings view.
+- Read current and archived OpenSpec changes as an overview, task list, or exact source.
+- Distinguish Active, Done, and Archived changes while keeping task progress separate.
+- Find recently modified work first, grouped by local date ranges.
 - Check task progress from source checkboxes.
-- Find common plan, TDD, and roadmap files.
-- Browse all safely indexed Markdown when a file has another name.
+- Configure removable regular-expression patterns for planning Markdown paths.
+- Browse all safely indexed Markdown when a file is not planning work.
 - Copy an exact path or continuation prompt into a new agent session.
 - Ask Pi for a summary when you choose to send the source.
 
@@ -65,11 +68,13 @@ The scanned repo stays unchanged throughout this flow.
 The public preview includes:
 
 - Local discovery of Git working trees
-- Recognized OpenSpec change bundles
+- Current and archived OpenSpec change bundles
 - Structured OpenSpec overview, task, and source views
-- Common plan, TDD, and roadmap candidates
+- Explicit Active, Done, and Archived status with open/done task counts
+- Configurable planning-path patterns with removable plan, TDD, and roadmap defaults
+- App-owned approved-root management
 - Opt-in browsing of safely indexed Markdown
-- Search and filters
+- Newest-first date grouping, search, and filters
 - Bounded row mounting for large indexes
 - Optional, cached Pi summaries
 - Freshness checks

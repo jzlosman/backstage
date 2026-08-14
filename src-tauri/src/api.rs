@@ -61,6 +61,7 @@ pub fn derive_continuation_prompt(
         artifact_path: detail.absolute_path,
         bundle_kind: detail.bundle_kind,
         recognition: detail.recognition,
+        custody: detail.custody,
         progress: detail.progress,
         warnings: detail.warnings,
     }))

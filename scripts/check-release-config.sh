@@ -33,6 +33,7 @@ require_match README.md 'docs/images/backstage-overview\.png' 'the product scree
 
 require_match .github/workflows/ci.yml 'pull_request:' 'pull-request verification'
 require_match .github/workflows/ci.yml 'contents: read' 'read-only repository permissions'
+require_match .github/workflows/ci.yml 'components:.*rustfmt,clippy' 'Rust formatting and lint components'
 if grep -Eq 'APPLE_(CERTIFICATE|API_KEY|API_ISSUER)' .github/workflows/ci.yml; then
   fail '.github/workflows/ci.yml must not reference Apple release secrets'
 fi
@@ -42,6 +43,7 @@ require_match .github/workflows/release.yml 'tags:' 'a tag trigger'
 require_match .github/workflows/release.yml "['\"]?v\\*['\"]?" 'v* release tags'
 require_match .github/workflows/release.yml 'environment: release' 'the protected release environment'
 require_match .github/workflows/release.yml 'universal-apple-darwin' 'a universal macOS build'
+require_match .github/workflows/release.yml 'components:.*rustfmt,clippy' 'Rust formatting and lint components'
 require_match .github/workflows/release.yml 'APPLE_CERTIFICATE' 'the signing certificate secret'
 require_match .github/workflows/release.yml 'APPLE_API_KEY_PATH' 'the notarization key path'
 require_match .github/workflows/release.yml "github.event_name == ['\"]push['\"]" 'tag-push-only publication'

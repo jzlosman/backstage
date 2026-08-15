@@ -175,10 +175,10 @@ impl ContainedReader {
         results
     }
 
-    pub fn regular_file_modified_unix_nanos(
+    pub fn regular_file_observation(
         &self,
         requested: impl AsRef<Path>,
-    ) -> Result<Option<u128>, ReadError> {
+    ) -> Result<SourceObservation, ReadError> {
         let (relative, display) = self.relative_path(requested.as_ref())?;
         let metadata = self
             .root_dir
@@ -187,16 +187,15 @@ impl ContainedReader {
         if !metadata.is_file() {
             return Err(ReadError::NotAFile { path: display });
         }
-        Ok(metadata
-            .modified()
-            .ok()
-            .and_then(|modified| {
-                modified
-                    .into_std()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-            })
-            .map(|duration| duration.as_nanos()))
+        Ok(observation(&metadata))
+    }
+
+    pub fn regular_file_modified_unix_nanos(
+        &self,
+        requested: impl AsRef<Path>,
+    ) -> Result<Option<u128>, ReadError> {
+        self.regular_file_observation(requested)
+            .map(|observation| observation.modified_unix_nanos)
     }
 
     pub fn resolve_file(&self, requested: impl AsRef<Path>) -> Result<PathBuf, ReadError> {

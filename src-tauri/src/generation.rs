@@ -40,6 +40,35 @@ pub fn build_generation_snapshot(
     prompt_version: impl Into<String>,
     limits: &GenerationLimits,
 ) -> Result<GenerationSnapshot, SnapshotError> {
+    build_generation_snapshot_with_root(reader, None, paths, mode, prompt_version, limits)
+}
+
+pub fn build_project_generation_snapshot(
+    reader: &ContainedReader,
+    project_root: &Path,
+    paths: &[PathBuf],
+    mode: GenerationMode,
+    prompt_version: impl Into<String>,
+    limits: &GenerationLimits,
+) -> Result<GenerationSnapshot, SnapshotError> {
+    build_generation_snapshot_with_root(
+        reader,
+        Some(project_root),
+        paths,
+        mode,
+        prompt_version,
+        limits,
+    )
+}
+
+fn build_generation_snapshot_with_root(
+    reader: &ContainedReader,
+    project_root: Option<&Path>,
+    paths: &[PathBuf],
+    mode: GenerationMode,
+    prompt_version: impl Into<String>,
+    limits: &GenerationLimits,
+) -> Result<GenerationSnapshot, SnapshotError> {
     if paths.is_empty() || paths.len() > limits.max_files {
         return Err(SnapshotError::IncompleteManifest);
     }
@@ -49,6 +78,13 @@ pub fn build_generation_snapshot(
         let snapshot = reader
             .read_snapshot(path)
             .map_err(|_| SnapshotError::IncompleteManifest)?;
+        let snapshot = match project_root {
+            Some(project_root) => snapshot.with_relative_path(
+                path.strip_prefix(project_root)
+                    .map_err(|_| SnapshotError::InvalidRelativePath)?,
+            )?,
+            None => snapshot,
+        };
         total_bytes = total_bytes
             .checked_add(snapshot.content().len())
             .ok_or(SnapshotError::IncompleteManifest)?;

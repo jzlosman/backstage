@@ -1,8 +1,11 @@
 mod support;
 
+use backstage_app_lib::catalog::live_bundle_state;
 use backstage_app_lib::filesystem::ContainedReader;
-use backstage_app_lib::generation::{GenerationLimits, build_generation_snapshot};
-use backstage_core::{GenerationMode, SnapshotError};
+use backstage_app_lib::generation::{
+    GenerationLimits, build_generation_snapshot, build_project_generation_snapshot,
+};
+use backstage_core::{ArtifactBundle, GenerationMode, SnapshotError};
 use tempfile::TempDir;
 
 use support::FixtureRepo;
@@ -45,6 +48,54 @@ fn bounded_snapshot_contains_relative_untrusted_source_and_provenance() {
     );
     assert_eq!(snapshot.prompt_version, "summary-v1");
     fixture.assert_unchanged(&before);
+}
+
+#[test]
+fn nested_project_snapshot_uses_project_relative_paths() {
+    let root = TempDir::new().expect("root");
+    let project = root.path().join("nested-project");
+    let source = project.join("openspec/changes/nested/tasks.md");
+    std::fs::create_dir_all(source.parent().expect("source parent")).expect("source directory");
+    std::fs::write(&source, "# Tasks\n\n- [ ] Nested\n").expect("source");
+    let reader = ContainedReader::approve(root.path(), 1024 * 1024).expect("approve root");
+
+    let snapshot = build_project_generation_snapshot(
+        &reader,
+        &project,
+        &[source],
+        GenerationMode::Summary,
+        "summary-v1",
+        &GenerationLimits::default(),
+    )
+    .expect("nested snapshot");
+
+    assert_eq!(
+        snapshot.included_paths,
+        vec!["openspec/changes/nested/tasks.md"]
+    );
+    assert!(
+        snapshot
+            .envelope
+            .contains("path=\"openspec/changes/nested/tasks.md\"")
+    );
+    assert!(!snapshot.envelope.contains("nested-project/"));
+
+    let bundle: ArtifactBundle = serde_json::from_value(serde_json::json!({
+        "id": "bundle_nested",
+        "projectId": "project_nested",
+        "projectName": "nested-project",
+        "name": "nested",
+        "kind": "open_spec_change",
+        "recognition": { "status": "recognized", "detector": "openspec-v1" },
+        "members": [{
+            "id": "tasks_nested",
+            "relativePath": "openspec/changes/nested/tasks.md",
+            "evidence": "OpenSpec change material"
+        }]
+    }))
+    .expect("bundle");
+    let live = live_bundle_state(&reader, &project, &bundle).expect("live bundle state");
+    assert_eq!(snapshot.source_fingerprint, live.fingerprint);
 }
 
 #[test]

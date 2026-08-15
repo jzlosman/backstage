@@ -12,25 +12,27 @@ pub mod pi;
 pub mod pi_jobs;
 pub mod storage;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use backstage_core::{
-    ApprovedRoot, GeneratedResult, GeneratedView, GenerationMode, PlanningPattern,
-    PlanningPatternConfiguration, PlanningPatternError, generation_completed, generation_failed,
-    previous_result, sources_changed, start_generation,
+    AnnotationCommand, AnnotationRejection, ApprovedRoot, GeneratedResult, GeneratedView,
+    GenerationMode, PlanningPattern, PlanningPatternConfiguration, PlanningPatternError, SubjectId,
+    SupersessionGraph, WorkRecordAnnotation, generation_completed, generation_failed,
+    previous_result, sources_changed, start_generation, transition_annotation,
 };
 use parking_lot::Mutex;
+use serde::Serialize;
 use tauri::State;
 
 pub use api::{
     ApiError, approve_root_path, derive_artifact_path, derive_continuation_prompt,
     derive_markdown_path, list_approved_roots, remove_approved_root,
 };
-use catalog::{ArtifactDetail, MarkdownDetail};
+use catalog::{ArtifactDetail, MarkdownDetail, WorkRecordDetail, WorkRecordHandoffDetail};
 use discovery::{CancellationToken, DiscoveryResult, ScanPolicy, discover_projects};
 use filesystem::ContainedReader;
-use generation::{GenerationLimits, build_generation_snapshot, bundle_generation_paths};
+use generation::{GenerationLimits, build_project_generation_snapshot, bundle_generation_paths};
 use index::{CompletionDisposition, IndexSnapshot, IndexedBundle, ScanCoordinator};
 use launcher::{Launcher, SystemProcessRunner};
 use pi::{PiCapability, PiConfig, SystemCommandRunner, probe_pi};
@@ -40,8 +42,9 @@ use storage::{RootRemovalInventory, SqliteStore, StoreError};
 pub struct RuntimeState {
     store: SqliteStore,
     scans: ScanCoordinator,
-    generated: Mutex<BTreeMap<String, GeneratedView>>,
+    generated: Mutex<BTreeMap<SubjectId, GeneratedView>>,
     settings_mutation: Mutex<()>,
+    annotation_mutation: Mutex<()>,
     generated_publication: Mutex<()>,
     scan_admission: Mutex<()>,
     scan_cancellations: Mutex<BTreeMap<String, CancellationToken>>,
@@ -51,7 +54,7 @@ pub struct RuntimeState {
 
 struct ActivePiRequest {
     root_id: String,
-    bundle_id: String,
+    subject_id: SubjectId,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -144,12 +147,7 @@ fn add_pattern_runtime_with_response_seam(
         .map_err(pattern_store_error)?;
     let (roots, failed_root_ids) = rescan_pattern_roots(&configuration, state)?;
     at_response_seam();
-    Ok(pattern_mutation_response(
-        configuration,
-        &roots,
-        failed_root_ids,
-        state,
-    ))
+    pattern_mutation_response(configuration, &roots, failed_root_ids, state)
 }
 
 fn remove_pattern_runtime(id: &str, state: &RuntimeState) -> Result<PatternMutation, ApiError> {
@@ -175,12 +173,7 @@ fn rescan_after_pattern_mutation(
     state: &RuntimeState,
 ) -> Result<PatternMutation, ApiError> {
     let (roots, failed_root_ids) = rescan_pattern_roots(&configuration, state)?;
-    Ok(pattern_mutation_response(
-        configuration,
-        &roots,
-        failed_root_ids,
-        state,
-    ))
+    pattern_mutation_response(configuration, &roots, failed_root_ids, state)
 }
 
 fn rescan_pattern_roots(
@@ -208,7 +201,7 @@ fn pattern_mutation_response(
     roots: &[ApprovedRoot],
     failed_root_ids: Vec<String>,
     state: &RuntimeState,
-) -> PatternMutation {
+) -> Result<PatternMutation, ApiError> {
     let indexes = roots
         .iter()
         .filter_map(|root| {
@@ -217,13 +210,14 @@ fn pattern_mutation_response(
                 .current(root.id())
                 .or_else(|| state.store.load_index(root.id()).ok().flatten())
         })
-        .collect();
-    PatternMutation {
+        .map(|index| overlay_index_annotations(index, &state.store))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PatternMutation {
         patterns: configuration.patterns,
         configuration_revision: configuration.revision,
         indexes,
         failed_root_ids,
-    }
+    })
 }
 
 fn run_bounded_tasks<T: Sync>(
@@ -329,16 +323,34 @@ fn scan_root_with_configuration_after_initial_check(
         state.scans.cancel(&permit);
     } else {
         let _publication = state.generated_publication.lock();
-        if state.scans.complete(&permit, index.clone()) == CompletionDisposition::Accepted
-            && let Err(error) = state.store.save_index(&index)
-        {
-            discovered.warnings.push(discovery::ScanWarning {
-                code: "cache_write_failed".to_owned(),
-                path: root.path().to_owned(),
-                message: format!(
-                    "The new index is usable in memory but could not be cached: {error}"
-                ),
-            });
+        if state.scans.complete(&permit, index.clone()) == CompletionDisposition::Accepted {
+            let records = index
+                .projects
+                .iter()
+                .flat_map(|project| project.records.iter().cloned())
+                .collect::<Vec<_>>();
+            if let Err(error) =
+                state
+                    .store
+                    .refresh_work_record_subjects(root.id(), &records, &index.indexed_at)
+            {
+                discovered.warnings.push(discovery::ScanWarning {
+                    code: "annotation_store_failed".to_owned(),
+                    path: root.path().to_owned(),
+                    message: format!(
+                        "The index is usable but private annotations could not be refreshed: {error}"
+                    ),
+                });
+            }
+            if let Err(error) = state.store.save_index(&index) {
+                discovered.warnings.push(discovery::ScanWarning {
+                    code: "cache_write_failed".to_owned(),
+                    path: root.path().to_owned(),
+                    message: format!(
+                        "The new index is usable in memory but could not be cached: {error}"
+                    ),
+                });
+            }
         }
     }
     clear_scan_cancellation(state, root.id(), &cancellation);
@@ -360,6 +372,7 @@ fn remove_root_runtime(
     state: &RuntimeState,
 ) -> Result<RootRemovalInventory, ApiError> {
     let _settings = state.settings_mutation.lock();
+    let _annotations = state.annotation_mutation.lock();
     let _admission = state.scan_admission.lock();
     let _publication = state.generated_publication.lock();
     find_root(&state.store, root_id)?;
@@ -371,21 +384,26 @@ fn remove_root_runtime(
         .filter(|root| root.id() != root_id)
         .filter_map(|root| state.scans.current(root.id()))
         .collect::<Vec<_>>();
-    let inventory = state
+    let mut inventory = state
         .store
         .remove_root_state_with_retained_indexes(root_id, &retained_current)
         .map_err(pattern_store_error)?;
+    inventory.indexes = inventory
+        .indexes
+        .into_iter()
+        .map(|index| overlay_index_annotations(index, &state.store))
+        .collect::<Result<Vec<_>, _>>()?;
     if let Some(cancellation) = state.scan_cancellations.lock().remove(root_id) {
         cancellation.cancel();
     }
     state.scans.forget(root_id);
-    let mut cancelled_bundle_ids = std::collections::BTreeSet::new();
+    let mut cancelled_subject_ids = std::collections::BTreeSet::new();
     state.pi_cancellations.lock().retain(|_, request| {
         if request.root_id == root_id {
             request
                 .cancelled
                 .store(true, std::sync::atomic::Ordering::Release);
-            cancelled_bundle_ids.insert(request.bundle_id.clone());
+            cancelled_subject_ids.insert(request.subject_id.clone());
             false
         } else {
             true
@@ -395,16 +413,16 @@ fn remove_root_runtime(
         .indexes
         .iter()
         .flat_map(|index| &index.projects)
-        .flat_map(|project| &project.bundles)
-        .map(|bundle| bundle.bundle.id.as_str())
+        .flat_map(|project| &project.records)
+        .map(|record| record.subject_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
     let mut generated = state.generated.lock();
-    for bundle_id in cancelled_bundle_ids {
-        if !reachable.contains(bundle_id.as_str()) {
-            generated.remove(&bundle_id);
+    for subject_id in cancelled_subject_ids {
+        if !reachable.contains(&subject_id) {
+            generated.remove(&subject_id);
         }
     }
-    generated.retain(|bundle_id, _| reachable.contains(bundle_id.as_str()));
+    generated.retain(|subject_id, _| reachable.contains(subject_id));
     Ok(inventory)
 }
 
@@ -440,7 +458,7 @@ fn get_index(
     state: State<'_, RuntimeState>,
 ) -> Result<Option<IndexSnapshot>, ApiError> {
     if let Some(current) = state.scans.current(&root_id) {
-        return Ok(Some(current));
+        return overlay_index_annotations(current, &state.store).map(Some);
     }
     let cached = state
         .store
@@ -450,7 +468,25 @@ fn get_index(
         let _publication = state.generated_publication.lock();
         state.scans.hydrate(snapshot);
     }
-    Ok(cached)
+    cached
+        .map(|snapshot| overlay_index_annotations(snapshot, &state.store))
+        .transpose()
+}
+
+fn overlay_index_annotations(
+    mut index: IndexSnapshot,
+    store: &SqliteStore,
+) -> Result<IndexSnapshot, ApiError> {
+    for record in index
+        .projects
+        .iter_mut()
+        .flat_map(|project| &mut project.records)
+    {
+        record.annotation = store
+            .work_record_annotation(&record.subject_id)
+            .map_err(ApiError::from_error)?;
+    }
+    Ok(index)
 }
 
 #[tauri::command]
@@ -485,6 +521,220 @@ fn get_markdown_detail(
     let reader = ContainedReader::approve(root.path(), ScanPolicy::default().max_file_bytes)
         .map_err(ApiError::from_error)?;
     catalog::markdown_detail(&reader, &index, &document_id).map_err(ApiError::from_error)
+}
+
+#[tauri::command]
+fn get_work_record_detail(
+    root_id: String,
+    subject_id: String,
+    expected_generation: u64,
+    state: State<'_, RuntimeState>,
+) -> Result<WorkRecordDetail, ApiError> {
+    work_record_detail_runtime_with_seam(
+        &root_id,
+        &subject_id,
+        expected_generation,
+        state.inner(),
+        || {},
+    )
+}
+
+#[tauri::command]
+fn get_work_record_handoff(
+    root_id: String,
+    subject_id: String,
+    expected_generation: u64,
+    state: State<'_, RuntimeState>,
+) -> Result<WorkRecordHandoffDetail, ApiError> {
+    let root = find_root(&state.store, &root_id)?;
+    let index = runtime_index(&root_id, state.inner())?;
+    ensure_expected_record(&index, &subject_id, expected_generation)?;
+    let reader = ContainedReader::approve(root.path(), ScanPolicy::default().max_file_bytes)
+        .map_err(ApiError::from_error)?;
+    let handoff =
+        catalog::work_record_handoff(&reader, &index, &subject_id).map_err(ApiError::from_error)?;
+    let current = runtime_index(&root_id, state.inner())?;
+    ensure_expected_record(&current, &subject_id, handoff.index_generation)?;
+    Ok(handoff)
+}
+
+fn work_record_detail_runtime_with_seam(
+    root_id: &str,
+    subject_id: &str,
+    expected_generation: u64,
+    state: &RuntimeState,
+    after_capture: impl FnOnce(),
+) -> Result<WorkRecordDetail, ApiError> {
+    let root = find_root(&state.store, root_id)?;
+    let index = runtime_index(root_id, state)?;
+    ensure_expected_record(&index, subject_id, expected_generation)?;
+    let reader = ContainedReader::approve(root.path(), ScanPolicy::default().max_file_bytes)
+        .map_err(ApiError::from_error)?;
+    let mut detail =
+        catalog::work_record_detail(&reader, &index, subject_id).map_err(ApiError::from_error)?;
+    detail.record.annotation = state
+        .store
+        .work_record_annotation(&detail.subject_id)
+        .map_err(ApiError::from_error)?;
+    after_capture();
+    let current = runtime_index(root_id, state)?;
+    ensure_expected_record(&current, subject_id, detail.index_generation)?;
+    Ok(detail)
+}
+
+fn runtime_index(root_id: &str, state: &RuntimeState) -> Result<IndexSnapshot, ApiError> {
+    state
+        .scans
+        .current(root_id)
+        .or_else(|| state.store.load_index(root_id).ok().flatten())
+        .ok_or_else(|| ApiError::new("index_unavailable", "No usable index is available"))
+}
+
+fn ensure_expected_record(
+    index: &IndexSnapshot,
+    subject_id: &str,
+    expected_generation: u64,
+) -> Result<(), ApiError> {
+    if index.generation != expected_generation
+        || !index
+            .projects
+            .iter()
+            .flat_map(|project| &project.records)
+            .any(|record| record.subject_id.as_str() == subject_id)
+    {
+        return Err(ApiError::new(
+            "detail_stale",
+            "The selected Work Record changed before detail could be published",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnnotationTarget {
+    subject_id: SubjectId,
+    label: String,
+    exact_locator_key: String,
+    available: bool,
+}
+
+#[tauri::command]
+fn get_work_record_annotation_targets(
+    subject_id: String,
+    state: State<'_, RuntimeState>,
+) -> Result<Vec<AnnotationTarget>, ApiError> {
+    let subject_id = SubjectId::from_trusted(subject_id);
+    ensure_subject_reachable(state.inner(), &subject_id)?;
+    let reachable: HashSet<_> = state
+        .store
+        .list_roots()
+        .map_err(ApiError::from_error)?
+        .into_iter()
+        .filter_map(|root| {
+            state
+                .scans
+                .current(root.id())
+                .or_else(|| state.store.load_index(root.id()).ok().flatten())
+        })
+        .flat_map(|index| {
+            index
+                .projects
+                .into_iter()
+                .flat_map(|project| project.records)
+                .map(|record| record.subject_id)
+        })
+        .collect();
+    state
+        .store
+        .list_work_record_subjects()
+        .map_err(ApiError::from_error)
+        .map(|subjects| {
+            subjects
+                .into_iter()
+                .filter(|candidate| candidate.subject_id != subject_id)
+                .map(|candidate| AnnotationTarget {
+                    available: reachable.contains(&candidate.subject_id),
+                    subject_id: candidate.subject_id,
+                    label: candidate.display_name,
+                    exact_locator_key: candidate.exact_locator_key,
+                })
+                .collect()
+        })
+}
+
+#[tauri::command]
+fn get_work_record_annotation(
+    subject_id: String,
+    state: State<'_, RuntimeState>,
+) -> Result<WorkRecordAnnotation, ApiError> {
+    get_work_record_annotation_runtime(state.inner(), &SubjectId::from_trusted(subject_id))
+}
+
+#[tauri::command]
+fn update_work_record_annotation(
+    subject_id: String,
+    command: AnnotationCommand,
+    state: State<'_, RuntimeState>,
+) -> Result<WorkRecordAnnotation, ApiError> {
+    update_work_record_annotation_runtime(
+        state.inner(),
+        &SubjectId::from_trusted(subject_id),
+        command,
+        &chrono::Utc::now().to_rfc3339(),
+    )
+}
+
+fn get_work_record_annotation_runtime(
+    state: &RuntimeState,
+    subject_id: &SubjectId,
+) -> Result<WorkRecordAnnotation, ApiError> {
+    ensure_subject_reachable(state, subject_id)?;
+    state
+        .store
+        .work_record_annotation(subject_id)
+        .map_err(ApiError::from_error)
+}
+
+fn update_work_record_annotation_runtime(
+    state: &RuntimeState,
+    subject_id: &SubjectId,
+    command: AnnotationCommand,
+    updated_at: &str,
+) -> Result<WorkRecordAnnotation, ApiError> {
+    let _mutation = state.annotation_mutation.lock();
+    ensure_subject_reachable(state, subject_id)?;
+    let current = state
+        .store
+        .work_record_annotation(subject_id)
+        .map_err(ApiError::from_error)?;
+    let graph = SupersessionGraph::new(
+        state
+            .store
+            .supersession_edges()
+            .map_err(ApiError::from_error)?,
+        4_096,
+    );
+    let next = transition_annotation(subject_id, &current, command, &graph)
+        .map_err(annotation_rejection)?;
+    state
+        .store
+        .save_work_record_annotation(subject_id, &next, updated_at)
+        .map_err(ApiError::from_error)?;
+    ensure_subject_reachable(state, subject_id)?;
+    state
+        .store
+        .work_record_annotation(subject_id)
+        .map_err(ApiError::from_error)
+}
+
+fn annotation_rejection(error: AnnotationRejection) -> ApiError {
+    let code = match error {
+        AnnotationRejection::SelfSupersession { .. } => "annotation_self_supersession",
+        AnnotationRejection::SupersessionCycle { .. } => "annotation_supersession_cycle",
+        AnnotationRejection::GraphLimitExceeded { .. } => "annotation_graph_limit",
+    };
+    ApiError::new(code, error.to_string())
 }
 
 #[tauri::command]
@@ -597,7 +847,7 @@ fn get_generated_view(
     state: State<'_, RuntimeState>,
 ) -> Result<GeneratedView, ApiError> {
     let index = current_index(&root_id, &state)?;
-    let (project_root, bundle) = find_bundle(&index, &bundle_id)?;
+    let (project_root, bundle, subject_id) = find_bundle(&index, &bundle_id)?;
     let root = find_root(&state.store, &root_id)?;
     let reader = ContainedReader::approve(root.path(), ScanPolicy::default().max_file_bytes)
         .map_err(ApiError::from_error)?;
@@ -605,10 +855,10 @@ fn get_generated_view(
         .map_err(ApiError::from_error)?;
     let refreshed = {
         let _publication = state.generated_publication.lock();
-        ensure_bundle_reachable(state.inner(), &bundle_id)?;
+        ensure_subject_reachable(state.inner(), &subject_id)?;
         refresh_cached_generated_view(
             &state.generated,
-            &bundle_id,
+            &subject_id,
             &live.fingerprint,
             bundle
                 .bundle
@@ -623,7 +873,7 @@ fn get_generated_view(
     }
     let view = match state
         .store
-        .find_latest_generated_view(&bundle_id, GenerationMode::Summary, "summary-v1")
+        .find_latest_generated_view(&subject_id, GenerationMode::Summary, "summary-v1")
         .map_err(ApiError::from_error)?
     {
         Some(result) if result.source_fingerprint == live.fingerprint => {
@@ -635,7 +885,7 @@ fn get_generated_view(
         },
         None => GeneratedView::NeverGenerated,
     };
-    publish_generated_view(state.inner(), &bundle_id, view)
+    publish_generated_view(state.inner(), &subject_id, view)
 }
 
 #[tauri::command]
@@ -646,7 +896,7 @@ fn request_summary(
 ) -> Result<GeneratedView, ApiError> {
     let root = find_root(&state.store, &root_id)?;
     let index = current_index(&root_id, &state)?;
-    let (project_root, bundle) = find_bundle(&index, &bundle_id)?;
+    let (project_root, bundle, subject_id) = find_bundle(&index, &bundle_id)?;
     let paths = bundle_generation_paths(
         Path::new(project_root),
         &bundle
@@ -658,8 +908,9 @@ fn request_summary(
     );
     let reader = ContainedReader::approve(root.path(), ScanPolicy::default().max_file_bytes)
         .map_err(ApiError::from_error)?;
-    let snapshot = build_generation_snapshot(
+    let snapshot = build_project_generation_snapshot(
         &reader,
+        Path::new(project_root),
         &paths,
         GenerationMode::Summary,
         "summary-v1",
@@ -681,7 +932,7 @@ fn request_summary(
     if let Some(cached) = state
         .store
         .find_generated_view(
-            &bundle_id,
+            &subject_id,
             GenerationMode::Summary,
             snapshot.source_fingerprint.as_str(),
             &snapshot.prompt_version,
@@ -689,14 +940,14 @@ fn request_summary(
         .map_err(ApiError::from_error)?
     {
         let view = GeneratedView::Current { result: cached };
-        return publish_generated_view(state.inner(), &bundle_id, view);
+        return publish_generated_view(state.inner(), &subject_id, view);
     }
 
     let request_id = nonce;
     let prior = state
         .generated
         .lock()
-        .remove(&bundle_id)
+        .remove(&subject_id)
         .unwrap_or(GeneratedView::NeverGenerated);
     let prior_result = previous_result(&prior);
     let generating = start_generation(
@@ -709,7 +960,7 @@ fn request_summary(
         state.inner(),
         &request_id,
         &root_id,
-        &bundle_id,
+        &subject_id,
         generating.clone(),
         jobs.cancellation_flag(&request_id),
     )?;
@@ -740,7 +991,7 @@ fn request_summary(
             };
             persist_and_publish_generated_view(
                 state.inner(),
-                &bundle_id,
+                &subject_id,
                 result,
                 completed,
                 prior_result,
@@ -748,17 +999,17 @@ fn request_summary(
         }
         Some(GenerationJobEvent::Failed { failure, .. }) => publish_generated_view(
             state.inner(),
-            &bundle_id,
+            &subject_id,
             generation_failed(generating, &request_id, failure),
         ),
         Some(GenerationJobEvent::Cancelled { .. }) => publish_generated_view(
             state.inner(),
-            &bundle_id,
+            &subject_id,
             generation_failed(generating, &request_id, "Generation cancelled"),
         ),
         _ => publish_generated_view(
             state.inner(),
-            &bundle_id,
+            &subject_id,
             generation_failed(generating, &request_id, "Pi returned no terminal job event"),
         ),
     };
@@ -795,21 +1046,21 @@ fn register_active_pi_request(
     state: &RuntimeState,
     request_id: &str,
     root_id: &str,
-    bundle_id: &str,
+    subject_id: &SubjectId,
     generating: GeneratedView,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), ApiError> {
     let _publication = state.generated_publication.lock();
-    ensure_bundle_reachable(state, bundle_id)?;
+    ensure_subject_reachable(state, subject_id)?;
     state
         .generated
         .lock()
-        .insert(bundle_id.to_owned(), generating);
+        .insert(subject_id.clone(), generating);
     state.pi_cancellations.lock().insert(
         request_id.to_owned(),
         ActivePiRequest {
             root_id: root_id.to_owned(),
-            bundle_id: bundle_id.to_owned(),
+            subject_id: subject_id.clone(),
             cancelled,
         },
     );
@@ -818,43 +1069,43 @@ fn register_active_pi_request(
 
 fn publish_generated_view(
     state: &RuntimeState,
-    bundle_id: &str,
+    subject_id: &SubjectId,
     view: GeneratedView,
 ) -> Result<GeneratedView, ApiError> {
     let _publication = state.generated_publication.lock();
-    ensure_bundle_reachable(state, bundle_id)?;
+    ensure_subject_reachable(state, subject_id)?;
     state
         .generated
         .lock()
-        .insert(bundle_id.to_owned(), view.clone());
+        .insert(subject_id.clone(), view.clone());
     Ok(view)
 }
 
 fn persist_and_publish_generated_view(
     state: &RuntimeState,
-    bundle_id: &str,
+    subject_id: &SubjectId,
     result: &GeneratedResult,
     view: GeneratedView,
     previous: Option<GeneratedResult>,
 ) -> Result<GeneratedView, ApiError> {
     let _publication = state.generated_publication.lock();
-    ensure_bundle_reachable(state, bundle_id)?;
-    let view = match state.store.save_generated_view(bundle_id, result) {
+    ensure_subject_reachable(state, subject_id)?;
+    let view = match state.store.save_generated_view(subject_id, result) {
         Ok(()) => view,
         Err(error) => GeneratedView::Failed {
             previous,
             failure: format!("Summary generated but cache storage failed: {error}"),
         },
     };
-    ensure_bundle_reachable(state, bundle_id)?;
+    ensure_subject_reachable(state, subject_id)?;
     state
         .generated
         .lock()
-        .insert(bundle_id.to_owned(), view.clone());
+        .insert(subject_id.clone(), view.clone());
     Ok(view)
 }
 
-fn ensure_bundle_reachable(state: &RuntimeState, bundle_id: &str) -> Result<(), ApiError> {
+fn ensure_subject_reachable(state: &RuntimeState, subject_id: &SubjectId) -> Result<(), ApiError> {
     let roots = state.store.list_roots().map_err(ApiError::from_error)?;
     for root in roots {
         let index = match state.scans.current(root.id()) {
@@ -868,48 +1119,92 @@ fn ensure_bundle_reachable(state: &RuntimeState, bundle_id: &str) -> Result<(), 
             index
                 .projects
                 .iter()
-                .flat_map(|project| &project.bundles)
-                .any(|bundle| bundle.bundle.id == bundle_id)
+                .flat_map(|project| &project.records)
+                .any(|record| &record.subject_id == subject_id)
         }) {
             return Ok(());
         }
     }
-    state.generated.lock().remove(bundle_id);
+    state.generated.lock().remove(subject_id);
     Err(ApiError::new(
-        "root_or_bundle_unavailable",
-        "The approved root or generated bundle is no longer available",
+        "root_or_record_unavailable",
+        "The approved root or generated Work Record is no longer available",
     ))
 }
 
 fn refresh_cached_generated_view(
-    cache: &Mutex<BTreeMap<String, GeneratedView>>,
-    bundle_id: &str,
+    cache: &Mutex<BTreeMap<SubjectId, GeneratedView>>,
+    subject_id: &SubjectId,
     current_fingerprint: &backstage_core::SourceFingerprint,
     changed_inputs: Vec<String>,
 ) -> Option<GeneratedView> {
     let mut cache = cache.lock();
     let refreshed = sources_changed(
-        cache.get(bundle_id).cloned()?,
+        cache.get(subject_id).cloned()?,
         current_fingerprint,
         changed_inputs,
     );
-    cache.insert(bundle_id.to_owned(), refreshed.clone());
+    cache.insert(subject_id.clone(), refreshed.clone());
     Some(refreshed)
 }
 
 fn find_bundle<'a>(
     index: &'a IndexSnapshot,
-    bundle_id: &str,
-) -> Result<(&'a str, &'a IndexedBundle), ApiError> {
+    owner_id: &str,
+) -> Result<(&'a str, &'a IndexedBundle, SubjectId), ApiError> {
     index
         .projects
         .iter()
         .find_map(|project| {
-            project
+            if let Some(record) = project
+                .records
+                .iter()
+                .find(|record| record.subject_id.as_str() == owner_id)
+            {
+                let source_paths = record
+                    .sources
+                    .iter()
+                    .map(|source| source.relative_path.as_str())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let bundle = project.bundles.iter().find(|bundle| {
+                    bundle
+                        .bundle
+                        .members
+                        .iter()
+                        .map(|member| member.relative_path.as_str())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        == source_paths
+                })?;
+                return Some((
+                    project.project.root_path.as_str(),
+                    bundle,
+                    record.subject_id.clone(),
+                ));
+            }
+
+            let bundle = project
                 .bundles
                 .iter()
-                .find(|bundle| bundle.bundle.id == bundle_id)
-                .map(|bundle| (project.project.root_path.as_str(), bundle))
+                .find(|bundle| bundle.bundle.id == owner_id)?;
+            let member_paths = bundle
+                .bundle
+                .members
+                .iter()
+                .map(|member| member.relative_path.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            let record = project.records.iter().find(|record| {
+                record
+                    .sources
+                    .iter()
+                    .map(|source| source.relative_path.as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    == member_paths
+            })?;
+            Some((
+                project.project.root_path.as_str(),
+                bundle,
+                record.subject_id.clone(),
+            ))
         })
         .ok_or_else(|| ApiError::new("bundle_not_found", "Bundle is no longer indexed"))
 }
@@ -968,6 +1263,7 @@ pub fn run() {
             scans,
             generated: Mutex::new(BTreeMap::new()),
             settings_mutation: Mutex::new(()),
+            annotation_mutation: Mutex::new(()),
             generated_publication: Mutex::new(()),
             scan_admission: Mutex::new(()),
             scan_cancellations: Mutex::new(BTreeMap::new()),
@@ -987,6 +1283,11 @@ pub fn run() {
             get_index,
             get_artifact_detail,
             get_markdown_detail,
+            get_work_record_detail,
+            get_work_record_handoff,
+            get_work_record_annotation,
+            get_work_record_annotation_targets,
+            update_work_record_annotation,
             copy_artifact_path,
             copy_markdown_path,
             copy_continuation_prompt,
@@ -1018,6 +1319,7 @@ mod tests {
             scans: ScanCoordinator::default(),
             generated: Mutex::new(BTreeMap::new()),
             settings_mutation: Mutex::new(()),
+            annotation_mutation: Mutex::new(()),
             generated_publication: Mutex::new(()),
             scan_admission: Mutex::new(()),
             scan_cancellations: Mutex::new(BTreeMap::new()),
@@ -1028,6 +1330,7 @@ mod tests {
 
     fn empty_snapshot(root_id: &str, generation: u64, revision: u64) -> IndexSnapshot {
         IndexSnapshot {
+            schema_version: crate::index::CURRENT_INDEX_SCHEMA_VERSION,
             root_id: root_id.to_owned(),
             generation,
             indexed_at: "2026-08-14T00:00:00Z".to_owned(),
@@ -1415,27 +1718,27 @@ mod tests {
             "2026-08-14T00:00:01Z".to_owned(),
             discovered.warnings,
         );
-        let bundle_id = current.projects[0].bundles[0].bundle.id.clone();
+        let subject_id = current.projects[0].records[0].subject_id.clone();
         state.scans.hydrate(current.clone());
         let result = generated_result("memory-only summary");
         state
             .store
-            .save_generated_view(&bundle_id, &result)
+            .save_generated_view(&subject_id, &result)
             .expect("generated view");
         let view = GeneratedView::Current { result };
         state
             .generated
             .lock()
-            .insert(bundle_id.clone(), view.clone());
+            .insert(subject_id.clone(), view.clone());
 
         let inventory = remove_root_runtime(removed.id(), &state).expect("remove root");
 
         assert_eq!(inventory.indexes, vec![current]);
-        assert_eq!(state.generated.lock().get(&bundle_id), Some(&view));
+        assert_eq!(state.generated.lock().get(&subject_id), Some(&view));
         assert!(
             state
                 .store
-                .find_latest_generated_view(&bundle_id, GenerationMode::Summary, "summary-v1")
+                .find_latest_generated_view(&subject_id, GenerationMode::Summary, "summary-v1")
                 .expect("generated lookup")
                 .is_some()
         );
@@ -1450,6 +1753,7 @@ mod tests {
             scans: ScanCoordinator::default(),
             generated: Mutex::new(BTreeMap::new()),
             settings_mutation: Mutex::new(()),
+            annotation_mutation: Mutex::new(()),
             generated_publication: Mutex::new(()),
             scan_admission: Mutex::new(()),
             scan_cancellations: Mutex::new(BTreeMap::new()),
@@ -1485,6 +1789,7 @@ mod tests {
             scans: ScanCoordinator::default(),
             generated: Mutex::new(BTreeMap::new()),
             settings_mutation: Mutex::new(()),
+            annotation_mutation: Mutex::new(()),
             generated_publication: Mutex::new(()),
             scan_admission: Mutex::new(()),
             scan_cancellations: Mutex::new(BTreeMap::new()),
@@ -1629,6 +1934,271 @@ mod tests {
     }
 
     #[test]
+    fn annotation_commands_persist_authoritative_state_without_touching_repository_frontmatter() {
+        let state = test_runtime();
+        let root_dir = TempDir::new().expect("root");
+        let plan_path = root_dir.path().join("PLAN.md");
+        let source = "---\nfavorite: true\napproval: approved\n---\n# Plan\n";
+        let other_path = root_dir.path().join("OTHER.md");
+        let other_source = "# Alternative\n";
+        std::fs::write(&plan_path, source).expect("planning file");
+        std::fs::write(&other_path, other_source).expect("alternative file");
+        let root = approve_root_path(&state.store, root_dir.path()).expect("approval");
+        let configuration = state.store.planning_configuration().expect("configuration");
+        scan_root_with_configuration(&root, &configuration, &state).expect("scan");
+        let index = state.scans.current(root.id()).expect("index");
+        let subject_id = index.projects[0]
+            .records
+            .iter()
+            .find(|record| {
+                record
+                    .sources
+                    .iter()
+                    .any(|source| source.relative_path == "PLAN.md")
+            })
+            .expect("plan record")
+            .subject_id
+            .clone();
+        let replacement = index.projects[0]
+            .records
+            .iter()
+            .find(|record| {
+                record
+                    .sources
+                    .iter()
+                    .any(|source| source.relative_path == "OTHER.md")
+            })
+            .expect("replacement record")
+            .subject_id
+            .clone();
+
+        assert_eq!(
+            get_work_record_annotation_runtime(&state, &subject_id)
+                .expect("default private annotation"),
+            backstage_core::WorkRecordAnnotation::default()
+        );
+        let commands = vec![
+            backstage_core::AnnotationCommand::SetDecision(backstage_core::Decision::Approved),
+            backstage_core::AnnotationCommand::SetDecision(backstage_core::Decision::Rejected),
+            backstage_core::AnnotationCommand::SetDecision(backstage_core::Decision::Undecided),
+            backstage_core::AnnotationCommand::SetDisposition(
+                backstage_core::Disposition::Superseded {
+                    replacement: replacement.clone(),
+                },
+            ),
+            backstage_core::AnnotationCommand::SetDisposition(
+                backstage_core::Disposition::Obsolete,
+            ),
+            backstage_core::AnnotationCommand::SetDisposition(
+                backstage_core::Disposition::Applicable,
+            ),
+            backstage_core::AnnotationCommand::SetFavorite(true),
+            backstage_core::AnnotationCommand::SetFavorite(false),
+            backstage_core::AnnotationCommand::SetTodo(true),
+            backstage_core::AnnotationCommand::SetTodo(false),
+            backstage_core::AnnotationCommand::SetPriority(Some(backstage_core::Priority::Low)),
+            backstage_core::AnnotationCommand::SetPriority(Some(backstage_core::Priority::Medium)),
+            backstage_core::AnnotationCommand::SetPriority(None),
+            backstage_core::AnnotationCommand::SetDecision(backstage_core::Decision::Approved),
+            backstage_core::AnnotationCommand::SetFavorite(true),
+            backstage_core::AnnotationCommand::SetTodo(true),
+            backstage_core::AnnotationCommand::SetPriority(Some(backstage_core::Priority::High)),
+            backstage_core::AnnotationCommand::SetDisposition(
+                backstage_core::Disposition::Superseded { replacement },
+            ),
+        ];
+        let mut authoritative = backstage_core::WorkRecordAnnotation::default();
+        for (index, command) in commands.into_iter().enumerate() {
+            authoritative = update_work_record_annotation_runtime(
+                &state,
+                &subject_id,
+                command,
+                &format!("updated-{index}"),
+            )
+            .expect("annotation command");
+            assert_eq!(std::fs::read_to_string(&plan_path).expect("plan"), source);
+            assert_eq!(
+                std::fs::read_to_string(&other_path).expect("alternative"),
+                other_source
+            );
+        }
+
+        assert_eq!(authoritative.decision, backstage_core::Decision::Approved);
+        assert!(matches!(
+            authoritative.disposition,
+            backstage_core::Disposition::Superseded { .. }
+        ));
+        assert!(authoritative.favorite);
+        assert!(authoritative.todo);
+        assert_eq!(authoritative.priority, Some(backstage_core::Priority::High));
+        assert_eq!(
+            state
+                .store
+                .work_record_annotation(&subject_id)
+                .expect("stored annotation"),
+            authoritative
+        );
+        let indexed = state.scans.current(root.id()).expect("index");
+        let source_facts = indexed.projects[0]
+            .records
+            .iter()
+            .find(|record| record.subject_id == subject_id)
+            .expect("indexed plan")
+            .facts
+            .clone();
+        let overlaid =
+            overlay_index_annotations(indexed, &state.store).expect("annotation overlay");
+        let overlaid_plan = overlaid.projects[0]
+            .records
+            .iter()
+            .find(|record| record.subject_id == subject_id)
+            .expect("overlaid plan");
+        assert_eq!(overlaid_plan.annotation, authoritative);
+        assert_eq!(overlaid_plan.facts, source_facts);
+        assert_eq!(std::fs::read_to_string(plan_path).expect("source"), source);
+        assert_eq!(
+            std::fs::read_to_string(other_path).expect("alternative"),
+            other_source
+        );
+    }
+
+    #[test]
+    fn concurrent_independent_annotation_updates_do_not_overwrite_each_other() {
+        let state = Arc::new(test_runtime());
+        let root_dir = TempDir::new().expect("root");
+        std::fs::write(root_dir.path().join("PLAN.md"), "# Plan\n").expect("plan");
+        let root = approve_root_path(&state.store, root_dir.path()).expect("approval");
+        let configuration = state.store.planning_configuration().expect("configuration");
+        scan_root_with_configuration(&root, &configuration, &state).expect("scan");
+        let subject_id = state.scans.current(root.id()).expect("index").projects[0].records[0]
+            .subject_id
+            .clone();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let favorite_state = Arc::clone(&state);
+        let favorite_barrier = Arc::clone(&barrier);
+        let favorite_subject = subject_id.clone();
+        let favorite = std::thread::spawn(move || {
+            favorite_barrier.wait();
+            update_work_record_annotation_runtime(
+                &favorite_state,
+                &favorite_subject,
+                AnnotationCommand::SetFavorite(true),
+                "favorite",
+            )
+        });
+        let todo_state = Arc::clone(&state);
+        let todo_barrier = Arc::clone(&barrier);
+        let todo_subject = subject_id.clone();
+        let todo = std::thread::spawn(move || {
+            todo_barrier.wait();
+            update_work_record_annotation_runtime(
+                &todo_state,
+                &todo_subject,
+                AnnotationCommand::SetTodo(true),
+                "todo",
+            )
+        });
+
+        barrier.wait();
+        favorite
+            .join()
+            .expect("favorite thread")
+            .expect("favorite update");
+        todo.join().expect("todo thread").expect("todo update");
+
+        let annotation = state
+            .store
+            .work_record_annotation(&subject_id)
+            .expect("annotation");
+        assert!(annotation.favorite);
+        assert!(annotation.todo);
+    }
+
+    #[test]
+    fn concurrent_supersession_updates_cannot_commit_a_cycle() {
+        let state = Arc::new(test_runtime());
+        let root_dir = TempDir::new().expect("root");
+        std::fs::write(root_dir.path().join("A.md"), "# A\n").expect("A");
+        std::fs::write(root_dir.path().join("B.md"), "# B\n").expect("B");
+        let root = approve_root_path(&state.store, root_dir.path()).expect("approval");
+        let configuration = state.store.planning_configuration().expect("configuration");
+        scan_root_with_configuration(&root, &configuration, &state).expect("scan");
+        let subjects = state.scans.current(root.id()).expect("index").projects[0]
+            .records
+            .iter()
+            .map(|record| record.subject_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(subjects.len(), 2);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let first_state = Arc::clone(&state);
+        let first_barrier = Arc::clone(&barrier);
+        let first_source = subjects[0].clone();
+        let first_target = subjects[1].clone();
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            update_work_record_annotation_runtime(
+                &first_state,
+                &first_source,
+                AnnotationCommand::SetDisposition(backstage_core::Disposition::Superseded {
+                    replacement: first_target,
+                }),
+                "first",
+            )
+        });
+        let second_state = Arc::clone(&state);
+        let second_barrier = Arc::clone(&barrier);
+        let second_source = subjects[1].clone();
+        let second_target = subjects[0].clone();
+        let second = std::thread::spawn(move || {
+            second_barrier.wait();
+            update_work_record_annotation_runtime(
+                &second_state,
+                &second_source,
+                AnnotationCommand::SetDisposition(backstage_core::Disposition::Superseded {
+                    replacement: second_target,
+                }),
+                "second",
+            )
+        });
+
+        barrier.wait();
+        let results = [
+            first.join().expect("first thread"),
+            second.join().expect("second thread"),
+        ];
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert_eq!(state.store.supersession_edges().expect("edges").len(), 1);
+    }
+
+    #[test]
+    fn delayed_neutral_detail_is_rejected_after_a_newer_index_replaces_selection() {
+        let state = test_runtime();
+        let root_dir = TempDir::new().expect("root");
+        std::fs::write(root_dir.path().join("PLAN.md"), "# Plan\n").expect("planning file");
+        let root = approve_root_path(&state.store, root_dir.path()).expect("approval");
+        let configuration = state.store.planning_configuration().expect("configuration");
+        scan_root_with_configuration(&root, &configuration, &state).expect("scan");
+        let current = state.scans.current(root.id()).expect("index");
+        let subject_id = current.projects[0].records[0].subject_id.clone();
+        let expected_generation = current.generation;
+        let mut newer = current;
+        newer.generation += 1;
+
+        let error = work_record_detail_runtime_with_seam(
+            root.id(),
+            subject_id.as_str(),
+            expected_generation,
+            &state,
+            || state.scans.hydrate(newer),
+        )
+        .expect_err("delayed detail must be rejected");
+
+        assert_eq!(error.code, "detail_stale");
+    }
+
+    #[test]
     fn delayed_summary_completion_after_sole_root_removal_cannot_resurrect_generated_data() {
         let state = test_runtime();
         let root_dir = TempDir::new().expect("root");
@@ -1636,9 +2206,8 @@ mod tests {
         let root = approve_root_path(&state.store, root_dir.path()).expect("approval");
         let configuration = state.store.planning_configuration().expect("configuration");
         scan_root_with_configuration(&root, &configuration, &state).expect("scan");
-        let bundle_id = state.scans.current(root.id()).expect("index").projects[0].bundles[0]
-            .bundle
-            .id
+        let subject_id = state.scans.current(root.id()).expect("index").projects[0].records[0]
+            .subject_id
             .clone();
         let request_id = "request_delayed";
         let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1646,12 +2215,12 @@ mod tests {
             request_id.to_owned(),
             ActivePiRequest {
                 root_id: root.id().to_owned(),
-                bundle_id: bundle_id.clone(),
+                subject_id: subject_id.clone(),
                 cancelled: std::sync::Arc::clone(&cancellation),
             },
         );
         state.generated.lock().insert(
-            bundle_id.clone(),
+            subject_id.clone(),
             start_generation(
                 GeneratedView::NeverGenerated,
                 request_id,
@@ -1663,26 +2232,26 @@ mod tests {
 
         assert!(cancellation.load(std::sync::atomic::Ordering::Acquire));
         assert!(!state.pi_cancellations.lock().contains_key(request_id));
-        assert!(!state.generated.lock().contains_key(&bundle_id));
+        assert!(!state.generated.lock().contains_key(&subject_id));
 
         let result = generated_result("delayed summary");
         let error = persist_and_publish_generated_view(
             &state,
-            &bundle_id,
+            &subject_id,
             &result,
             GeneratedView::Current {
                 result: result.clone(),
             },
             None,
         )
-        .expect_err("removed bundle must reject delayed completion");
+        .expect_err("removed record must reject delayed completion");
 
-        assert_eq!(error.code, "root_or_bundle_unavailable");
-        assert!(!state.generated.lock().contains_key(&bundle_id));
+        assert_eq!(error.code, "root_or_record_unavailable");
+        assert!(!state.generated.lock().contains_key(&subject_id));
         assert!(
             state
                 .store
-                .find_latest_generated_view(&bundle_id, GenerationMode::Summary, "summary-v1")
+                .find_latest_generated_view(&subject_id, GenerationMode::Summary, "summary-v1")
                 .expect("generated lookup")
                 .is_none()
         );
@@ -1700,7 +2269,7 @@ mod tests {
         let configuration = state.store.planning_configuration().expect("configuration");
         scan_root_with_configuration(&owner, &configuration, &state).expect("owner scan");
         let owner_index = state.scans.current(owner.id()).expect("owner index");
-        let bundle_id = owner_index.projects[0].bundles[0].bundle.id.clone();
+        let subject_id = owner_index.projects[0].records[0].subject_id.clone();
         let mut overlapping_index = owner_index;
         overlapping_index.root_id = overlapping.id().to_owned();
         overlapping_index.generation += 1;
@@ -1714,7 +2283,7 @@ mod tests {
             "request_overlap".to_owned(),
             ActivePiRequest {
                 root_id: owner.id().to_owned(),
-                bundle_id: bundle_id.clone(),
+                subject_id: subject_id.clone(),
                 cancelled: std::sync::Arc::clone(&cancellation),
             },
         );
@@ -1725,12 +2294,12 @@ mod tests {
             result: result.clone(),
         };
         let published =
-            persist_and_publish_generated_view(&state, &bundle_id, &result, view.clone(), None)
+            persist_and_publish_generated_view(&state, &subject_id, &result, view.clone(), None)
                 .expect("overlap remains reachable");
 
         assert!(cancellation.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(published, view);
-        assert_eq!(state.generated.lock().get(&bundle_id), Some(&view));
+        assert_eq!(state.generated.lock().get(&subject_id), Some(&view));
     }
 
     #[test]
@@ -1741,20 +2310,19 @@ mod tests {
         let root = approve_root_path(&state.store, root_dir.path()).expect("approval");
         let configuration = state.store.planning_configuration().expect("configuration");
         scan_root_with_configuration(&root, &configuration, &state).expect("scan");
-        let bundle_id = state.scans.current(root.id()).expect("index").projects[0].bundles[0]
-            .bundle
-            .id
+        let subject_id = state.scans.current(root.id()).expect("index").projects[0].records[0]
+            .subject_id
             .clone();
         remove_root_runtime(root.id(), &state).expect("remove root");
         let cached = GeneratedView::Current {
             result: generated_result("cached summary"),
         };
 
-        let error = publish_generated_view(&state, &bundle_id, cached)
-            .expect_err("removed bundle must reject cached publication");
+        let error = publish_generated_view(&state, &subject_id, cached)
+            .expect_err("removed record must reject cached publication");
 
-        assert_eq!(error.code, "root_or_bundle_unavailable");
-        assert!(!state.generated.lock().contains_key(&bundle_id));
+        assert_eq!(error.code, "root_or_record_unavailable");
+        assert!(!state.generated.lock().contains_key(&subject_id));
     }
 
     #[test]
@@ -1772,17 +2340,15 @@ mod tests {
                 prompt_version: "summary-v1".to_owned(),
             },
         };
-        let cache = Arc::new(Mutex::new(BTreeMap::from([(
-            "bundle_1".to_owned(),
-            cached,
-        )])));
+        let subject_id = SubjectId::from_trusted("subject_1");
+        let cache = Arc::new(Mutex::new(BTreeMap::from([(subject_id.clone(), cached)])));
         let worker_cache = Arc::clone(&cache);
         let (completed, completion) = mpsc::channel();
 
         std::thread::spawn(move || {
             let refreshed = refresh_cached_generated_view(
                 &worker_cache,
-                "bundle_1",
+                &subject_id,
                 &current_fingerprint,
                 vec!["tasks.md".to_owned()],
             );
@@ -1796,6 +2362,9 @@ mod tests {
             .expect("cached refresh must not deadlock")
             .expect("cached view exists");
         assert!(matches!(refreshed, GeneratedView::Stale { .. }));
-        assert_eq!(cache.lock().get("bundle_1"), Some(&refreshed));
+        assert_eq!(
+            cache.lock().get(&SubjectId::from_trusted("subject_1")),
+            Some(&refreshed)
+        );
     }
 }

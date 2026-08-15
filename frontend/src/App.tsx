@@ -12,6 +12,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, RefObject } from "react";
 
 import { compareDatedRecords, groupDatedRecords, validSourceMilliseconds } from "./activity";
+import { WorkRecordReadingDesk } from "./CapabilityRenderer";
 import backstageMark from "./assets/backstage-mark.svg";
 import { runtimeApi } from "./api";
 import {
@@ -26,6 +27,8 @@ import {
 import { renderMarkdown } from "./markdown";
 import { settleBatches } from "./settleBatches";
 import type {
+  AnnotationCommand,
+  AnnotationTarget,
   ApprovedRoot,
   ArtifactDetail,
   BackstageApi,
@@ -42,14 +45,43 @@ import type {
   Project,
   ScanWarning,
   SourceTimestamp,
+  WorkRecord,
+  WorkRecordAnnotation,
+  WorkRecordDetail,
 } from "./api";
 
 type WorkspaceStatus =
   "loading" | "no-root" | "scanning" | "ready" | "ready-with-warnings" | "unavailable";
 type RegistryScope = "planning" | "markdown";
 type BundleFilter = "current" | "active" | "done" | "archived" | "warning" | "stale";
+type AnnotationFilter =
+  | "all"
+  | "undecided"
+  | "approved"
+  | "rejected"
+  | "applicable"
+  | "obsolete"
+  | "superseded"
+  | "favorite"
+  | "todo"
+  | "priority_low"
+  | "priority_medium"
+  | "priority_high";
 type IndexedMarkdownDocument = MarkdownDocument & { rootId: string };
+type IndexedWorkRecord = {
+  rootId: string;
+  indexGeneration: number;
+  project: Project;
+  record: WorkRecord;
+  generationSupported: boolean;
+};
 type LedgerRecord =
+  | {
+      kind: "record";
+      id: string;
+      sourceModifiedUnixNanos: SourceTimestamp;
+      record: IndexedWorkRecord;
+    }
   | { kind: "bundle"; id: string; sourceModifiedUnixNanos: SourceTimestamp; bundle: IndexedBundle }
   | {
       kind: "document";
@@ -76,10 +108,14 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
   const [selectedProjectId, setSelectedProjectId] = useState("all");
   const [registryScope, setRegistryScope] = useState<RegistryScope>("planning");
   const [bundleFilter, setBundleFilter] = useState<BundleFilter>("current");
+  const [annotationFilter, setAnnotationFilter] = useState<AnnotationFilter>("all");
   const [currentTime, setCurrentTime] = useState(clock);
   const [ledgerLimit, setLedgerLimit] = useState(LEDGER_BATCH_SIZE);
+  const [selectedWorkRecord, setSelectedWorkRecord] = useState<WorkRecordDetail | null>(null);
+  const [storedAnnotationTargets, setStoredAnnotationTargets] = useState<AnnotationTarget[]>([]);
   const [selectedArtifact, setSelectedArtifact] = useState<ArtifactDetail | null>(null);
   const [selectedMarkdown, setSelectedMarkdown] = useState<MarkdownDetail | null>(null);
+  const selectedWorkRecordRef = useRef<WorkRecordDetail | null>(null);
   const selectedArtifactRef = useRef<ArtifactDetail | null>(null);
   const detailRequestRef = useRef(0);
   const scanRequestRef = useRef(0);
@@ -131,11 +167,91 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
     return () => window.clearTimeout(timer);
   }, [clock]);
 
+  const reconcileSelectedWorkRecord = useCallback(
+    async (nextIndexes: IndexSnapshot[], inventoryEpoch: number, detailRequest: number) => {
+      const selected = selectedWorkRecordRef.current;
+      if (!selected || !api.getWorkRecordDetail) return;
+      let retained: IndexedWorkRecord | undefined;
+      for (const index of [...nextIndexes].sort((left, right) =>
+        left.rootId.localeCompare(right.rootId),
+      )) {
+        for (const project of index.projects) {
+          const record = project.records?.find(
+            (candidate) => candidate.subjectId === selected.subjectId,
+          );
+          if (!record) continue;
+          retained = {
+            rootId: index.rootId,
+            indexGeneration: index.generation,
+            project: project.project,
+            record,
+            generationSupported: project.bundles.some((bundle) =>
+              samePaths(
+                record.sources.map((source) => source.relativePath),
+                bundle.bundle.members.map((member) => member.relativePath),
+              ),
+            ),
+          };
+          break;
+        }
+        if (retained) break;
+      }
+      if (!retained) {
+        if (selectedWorkRecordRef.current?.subjectId === selected.subjectId) {
+          selectedWorkRecordRef.current = null;
+          setSelectedWorkRecord(null);
+        }
+        return;
+      }
+      try {
+        const detailPromise = api.getWorkRecordDetail(
+          retained.rootId,
+          retained.record.subjectId,
+          retained.indexGeneration,
+        );
+        const generatedPromise = retained.generationSupported
+          ? api.getGeneratedView(retained.rootId, retained.record.subjectId).catch(() => undefined)
+          : Promise.resolve(undefined);
+        const [detail, generated] = await Promise.all([detailPromise, generatedPromise]);
+        if (
+          inventoryEpoch !== inventoryEpochRef.current ||
+          detailRequest !== detailRequestRef.current ||
+          selectedWorkRecordRef.current?.subjectId !== selected.subjectId
+        ) {
+          return;
+        }
+        selectedWorkRecordRef.current = detail;
+        setSelectedWorkRecord(detail);
+        setGeneratedView(generated ?? { status: "never_generated" });
+        setGeneratedInventory((inventory) => {
+          if (generated) return { ...inventory, [retained.record.subjectId]: generated };
+          const next = { ...inventory };
+          delete next[retained.record.subjectId];
+          return next;
+        });
+      } catch (cause) {
+        if (
+          inventoryEpoch === inventoryEpochRef.current &&
+          detailRequest === detailRequestRef.current &&
+          selectedWorkRecordRef.current?.subjectId === selected.subjectId
+        ) {
+          selectedWorkRecordRef.current = null;
+          setSelectedWorkRecord(null);
+          setDetailError(errorMessage(cause));
+        }
+      }
+    },
+    [api],
+  );
+
   const scan = useCallback(
     async (nextRoots: ApprovedRoot[]) => {
       const requestId = ++scanRequestRef.current;
       if (nextRoots.length === 0) {
         ++inventoryEpochRef.current;
+        ++detailRequestRef.current;
+        selectedWorkRecordRef.current = null;
+        setSelectedWorkRecord(null);
         setProjects([]);
         setIndexes([]);
         setWarnings([]);
@@ -163,6 +279,7 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
         ).filter((index): index is IndexSnapshot => index !== null);
         if (requestId !== scanRequestRef.current) return;
         const bundleOwners = new Map<string, { rootId: string; bundle: IndexedBundle }>();
+        const generatedOwners = new Map<string, { rootId: string; ownerId: string }>();
         for (const index of [...nextIndexes].sort((left, right) =>
           left.rootId.localeCompare(right.rootId),
         )) {
@@ -172,23 +289,62 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
                 bundleOwners.set(bundle.bundle.id, { rootId: index.rootId, bundle });
               }
             }
+            for (const record of project.records ?? []) {
+              if (
+                !generatedOwners.has(record.subjectId) &&
+                project.bundles.some((bundle) =>
+                  samePaths(
+                    record.sources.map((source) => source.relativePath),
+                    bundle.bundle.members.map((member) => member.relativePath),
+                  ),
+                )
+              ) {
+                generatedOwners.set(record.subjectId, {
+                  rootId: index.rootId,
+                  ownerId: record.subjectId,
+                });
+              }
+            }
+            if (project.records === undefined) {
+              for (const bundle of project.bundles) {
+                if (!generatedOwners.has(bundle.bundle.id)) {
+                  generatedOwners.set(bundle.bundle.id, {
+                    rootId: index.rootId,
+                    ownerId: bundle.bundle.id,
+                  });
+                }
+              }
+            }
           }
         }
         const inventoryEpoch = ++inventoryEpochRef.current;
+        const detailRequest = ++detailRequestRef.current;
         const retainedBundleIds = new Set(bundleOwners.keys());
+        const retainedSubjectIds = new Set(
+          nextIndexes.flatMap((index) =>
+            index.projects.flatMap((project) =>
+              (project.records ?? []).map((record) => record.subjectId),
+            ),
+          ),
+        );
         setProjects(nextProjects);
         setIndexes(nextIndexes);
         setGeneratedInventory((inventory) =>
           Object.fromEntries(
-            Object.entries(inventory).filter(([bundleId]) => retainedBundleIds.has(bundleId)),
+            Object.entries(inventory).filter(
+              ([ownerId]) => retainedBundleIds.has(ownerId) || retainedSubjectIds.has(ownerId),
+            ),
           ),
         );
+        void reconcileSelectedWorkRecord(nextIndexes, inventoryEpoch, detailRequest);
         setWarnings(nextWarnings);
         const projectIdsWithWork = new Set(
           nextIndexes.flatMap((index) =>
             index.projects
-              .filter((project) =>
-                project.bundles.some((bundle) => bundle.bundle.members.length > 0),
+              .filter(
+                (project) =>
+                  (project.records?.length ?? 0) > 0 ||
+                  project.bundles.some((bundle) => bundle.bundle.members.length > 0),
               )
               .map((project) => project.project.id),
           ),
@@ -201,15 +357,13 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
         const isCurrentInventory = () =>
           requestId === scanRequestRef.current && inventoryEpoch === inventoryEpochRef.current;
         void settleBatches(
-          [...bundleOwners.values()],
+          [...generatedOwners.values()],
           GENERATED_INVENTORY_CONCURRENCY,
-          ({ rootId, bundle }) => api.getGeneratedView(rootId, bundle.bundle.id),
+          ({ rootId, ownerId }) => api.getGeneratedView(rootId, ownerId),
           (batch) => {
             if (!isCurrentInventory()) return;
             const generatedEntries = batch.flatMap(({ item, result }) =>
-              result.status === "fulfilled"
-                ? ([[item.bundle.bundle.id, result.value]] as const)
-                : [],
+              result.status === "fulfilled" ? ([[item.ownerId, result.value]] as const) : [],
             );
             if (generatedEntries.length === 0) return;
             setGeneratedInventory((inventory) =>
@@ -217,6 +371,13 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
                 ? { ...inventory, ...Object.fromEntries(generatedEntries) }
                 : inventory,
             );
+            const selectedSubjectId = selectedWorkRecordRef.current?.subjectId;
+            const selectedGenerated = generatedEntries.find(
+              ([ownerId]) => ownerId === selectedSubjectId,
+            );
+            if (selectedGenerated && isCurrentInventory()) {
+              setGeneratedView(selectedGenerated[1]);
+            }
           },
           isCurrentInventory,
         );
@@ -228,7 +389,7 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
         return false;
       }
     },
-    [api],
+    [api, reconcileSelectedWorkRecord],
   );
 
   const loadPatterns = useCallback(async () => {
@@ -308,14 +469,21 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
 
   const replaceIndexInventory = (nextIndexes: IndexSnapshot[]) => {
     ++scanRequestRef.current;
-    ++detailRequestRef.current;
-    ++inventoryEpochRef.current;
+    const detailRequest = ++detailRequestRef.current;
+    const inventoryEpoch = ++inventoryEpochRef.current;
     setIndexes(nextIndexes);
     setProjects(nextIndexes.flatMap((index) => index.projects.map((item) => item.project)));
     setWarnings(nextIndexes.flatMap((index) => index.warnings));
     const retainedBundleIds = new Set(
       nextIndexes.flatMap((index) =>
         index.projects.flatMap((project) => project.bundles.map((bundle) => bundle.bundle.id)),
+      ),
+    );
+    const retainedSubjectIds = new Set(
+      nextIndexes.flatMap((index) =>
+        index.projects.flatMap((project) =>
+          (project.records ?? []).map((record) => record.subjectId),
+        ),
       ),
     );
     const retainedDocumentIds = new Set(
@@ -326,8 +494,13 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
       ),
     );
     setGeneratedInventory((inventory) =>
-      Object.fromEntries(Object.entries(inventory).filter(([id]) => retainedBundleIds.has(id))),
+      Object.fromEntries(
+        Object.entries(inventory).filter(
+          ([id]) => retainedBundleIds.has(id) || retainedSubjectIds.has(id),
+        ),
+      ),
     );
+    void reconcileSelectedWorkRecord(nextIndexes, inventoryEpoch, detailRequest);
     if (selectedArtifact && retainedBundleIds.has(selectedArtifact.bundleId)) {
       const retainedOwner = [...nextIndexes]
         .sort((left, right) => left.rootId.localeCompare(right.rootId))
@@ -454,6 +627,18 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
     for (const index of indexes) {
       for (const indexedProject of index.projects) {
         const projectMembers = memberIds.get(indexedProject.project.id) ?? new Set<string>();
+        if (indexedProject.records !== undefined) {
+          for (const record of indexedProject.records) {
+            if (!recordInScope(record, registryScope)) continue;
+            if (!recordMatchesFilter(record, bundleFilter, generatedInventory)) continue;
+            if (!recordMatchesAnnotation(record, annotationFilter)) continue;
+            if (query && !recordSearchText(record, indexedProject.project).includes(query))
+              continue;
+            for (const source of record.sources) projectMembers.add(source.relativePath);
+          }
+          memberIds.set(indexedProject.project.id, projectMembers);
+          continue;
+        }
         const matchingBundles = indexedProject.bundles.filter(
           (bundle) =>
             bundleMatchesFilter(bundle, bundleFilter, generatedInventory) &&
@@ -493,7 +678,7 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
       }
     }
     return new Map([...memberIds].map(([projectId, members]) => [projectId, members.size]));
-  }, [bundleFilter, generatedInventory, indexes, registryScope, searchQuery]);
+  }, [annotationFilter, bundleFilter, generatedInventory, indexes, registryScope, searchQuery]);
 
   const workProjects = useMemo(() => {
     const unique = new Map<string, Project>();
@@ -523,6 +708,7 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
   }, [selectedProjectId, workProjects]);
 
   const visibleRecords = useMemo(() => {
+    const uniqueWorkRecords = new Map<string, IndexedWorkRecord>();
     const uniqueBundles = new Map<string, IndexedBundle>();
     const uniqueDocuments = new Map<string, IndexedMarkdownDocument>();
     for (const index of [...indexes].sort((left, right) =>
@@ -530,6 +716,25 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
     )) {
       for (const project of index.projects) {
         if (selectedProjectId !== "all" && project.project.id !== selectedProjectId) continue;
+        if (project.records !== undefined) {
+          for (const record of project.records) {
+            if (!uniqueWorkRecords.has(record.subjectId)) {
+              uniqueWorkRecords.set(record.subjectId, {
+                rootId: index.rootId,
+                indexGeneration: index.generation,
+                project: project.project,
+                record,
+                generationSupported: project.bundles.some((bundle) =>
+                  samePaths(
+                    record.sources.map((source) => source.relativePath),
+                    bundle.bundle.members.map((member) => member.relativePath),
+                  ),
+                ),
+              });
+            }
+          }
+          continue;
+        }
         for (const bundle of project.bundles) {
           if (!uniqueBundles.has(bundle.bundle.id)) uniqueBundles.set(bundle.bundle.id, bundle);
         }
@@ -546,6 +751,17 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
     }
 
     const query = searchQuery.trim().toLowerCase();
+    const records = [...uniqueWorkRecords.values()]
+      .filter(({ record }) => recordInScope(record, registryScope))
+      .filter(({ record }) => recordMatchesFilter(record, bundleFilter, generatedInventory))
+      .filter(({ record }) => recordMatchesAnnotation(record, annotationFilter))
+      .filter(({ record, project }) => !query || recordSearchText(record, project).includes(query))
+      .map((record): LedgerRecord => ({
+        kind: "record",
+        id: record.record.subjectId,
+        sourceModifiedUnixNanos: record.record.sourceModifiedUnixNanos,
+        record,
+      }));
     const bundles = [...uniqueBundles.values()]
       .filter((bundle) => bundleMatchesFilter(bundle, bundleFilter, generatedInventory))
       .filter(
@@ -584,15 +800,27 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
               document,
             }))
         : [];
-    return [...bundles, ...documents].sort(compareDatedRecords);
-  }, [bundleFilter, generatedInventory, indexes, registryScope, searchQuery, selectedProjectId]);
+    return [...records, ...bundles, ...documents].sort(compareDatedRecords);
+  }, [
+    annotationFilter,
+    bundleFilter,
+    generatedInventory,
+    indexes,
+    registryScope,
+    searchQuery,
+    selectedProjectId,
+  ]);
 
   const visibleRecordCount = visibleRecords.length;
   const visibleFileCount = new Set(
     visibleRecords.flatMap((record) =>
-      record.kind === "bundle"
-        ? record.bundle.bundle.members.map((member) => member.id)
-        : [record.document.id],
+      record.kind === "record"
+        ? record.record.record.sources.map(
+            (source) => `${record.record.project.id}:${source.relativePath}`,
+          )
+        : record.kind === "bundle"
+          ? record.bundle.bundle.members.map((member) => member.id)
+          : [record.document.id],
     ),
   ).size;
   const displayedRecords = visibleRecords.slice(0, ledgerLimit);
@@ -601,21 +829,90 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
 
   useEffect(
     () => setLedgerLimit(LEDGER_BATCH_SIZE),
-    [bundleFilter, indexes, registryScope, searchQuery, selectedProjectId],
+    [annotationFilter, bundleFilter, indexes, registryScope, searchQuery, selectedProjectId],
   );
 
+  const commitSelectedWorkRecord = useCallback((detail: WorkRecordDetail) => {
+    selectedWorkRecordRef.current = detail;
+    selectedArtifactRef.current = null;
+    setSelectedArtifact(null);
+    setSelectedMarkdown(null);
+    setSelectedWorkRecord(detail);
+  }, []);
+
   const commitSelectedArtifact = useCallback((detail: ArtifactDetail) => {
+    selectedWorkRecordRef.current = null;
     selectedArtifactRef.current = detail;
+    setSelectedWorkRecord(null);
     setSelectedMarkdown(null);
     setSelectedArtifact(detail);
   }, []);
 
   const commitSelectedMarkdown = useCallback((detail: MarkdownDetail) => {
+    selectedWorkRecordRef.current = null;
     selectedArtifactRef.current = null;
+    setSelectedWorkRecord(null);
     setSelectedArtifact(null);
     setSelectedMarkdown(detail);
     setGeneratedView({ status: "never_generated" });
   }, []);
+
+  const selectWorkRecord = useCallback(
+    async (indexed: IndexedWorkRecord) => {
+      const requestId = ++detailRequestRef.current;
+      const inventoryEpoch = inventoryEpochRef.current;
+      if (!api.getWorkRecordDetail) {
+        setDetailError("Neutral Work Record detail is unavailable in this build");
+        return;
+      }
+      const shouldLoadGenerated = indexed.generationSupported;
+      const generatedRequest = shouldLoadGenerated
+        ? Promise.resolve()
+            .then(() => api.getGeneratedView(indexed.rootId, indexed.record.subjectId))
+            .then(
+              (view) => ({ status: "fulfilled" as const, view }),
+              (cause: unknown) => ({ status: "rejected" as const, cause }),
+            )
+        : null;
+      try {
+        setDetailError(null);
+        const detail = await api.getWorkRecordDetail(
+          indexed.rootId,
+          indexed.record.subjectId,
+          indexed.indexGeneration,
+        );
+        if (requestId !== detailRequestRef.current || inventoryEpoch !== inventoryEpochRef.current)
+          return;
+        commitSelectedWorkRecord(detail);
+        setGeneratedView(
+          generatedInventory[indexed.record.subjectId] ?? { status: "never_generated" },
+        );
+        if (window.innerWidth <= 960) {
+          setPaneLayout((layout) => ({ ...layout, ledgerCollapsed: true }));
+        }
+      } catch (cause) {
+        if (requestId === detailRequestRef.current) setDetailError(errorMessage(cause));
+        return;
+      }
+      if (!generatedRequest) return;
+      const generated = await generatedRequest;
+      if (requestId !== detailRequestRef.current || inventoryEpoch !== inventoryEpochRef.current)
+        return;
+      if (generated.status === "rejected") {
+        setGeneratedView({
+          status: "never_generated",
+          capabilityReason: `Generated summary unavailable: ${errorMessage(generated.cause)}`,
+        });
+        return;
+      }
+      setGeneratedView(generated.view);
+      setGeneratedInventory((inventory) => ({
+        ...inventory,
+        [indexed.record.subjectId]: generated.view,
+      }));
+    },
+    [api, commitSelectedWorkRecord, generatedInventory],
+  );
 
   const selectBundle = useCallback(
     async (bundle: IndexedBundle) => {
@@ -703,19 +1000,25 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
   );
 
   useEffect(() => {
-    const selectedId = selectedArtifact?.bundleId ?? selectedMarkdown?.documentId;
+    const selectedId =
+      selectedWorkRecord?.subjectId ?? selectedArtifact?.bundleId ?? selectedMarkdown?.documentId;
     if (!selectedId || visibleRecords.some((record) => record.id === selectedId)) return;
     ++detailRequestRef.current;
+    selectedWorkRecordRef.current = null;
     selectedArtifactRef.current = null;
+    setSelectedWorkRecord(null);
     setSelectedArtifact(null);
     setSelectedMarkdown(null);
     setGeneratedView({ status: "never_generated" });
     const fallback = visibleRecords[0];
+    if (fallback?.kind === "record") void selectWorkRecord(fallback.record);
     if (fallback?.kind === "bundle") void selectBundle(fallback.bundle);
     if (fallback?.kind === "document") void selectDocument(fallback.document);
   }, [
     selectBundle,
     selectDocument,
+    selectWorkRecord,
+    selectedWorkRecord?.subjectId,
     selectedArtifact?.bundleId,
     selectedMarkdown?.documentId,
     visibleRecords,
@@ -740,9 +1043,131 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
     if (fallbackBundle) void selectBundle(fallbackBundle);
   };
 
+  useEffect(() => {
+    let active = true;
+    const subjectId = selectedWorkRecord?.subjectId;
+    if (!subjectId || !api.getWorkRecordAnnotationTargets) {
+      setStoredAnnotationTargets([]);
+      return () => {
+        active = false;
+      };
+    }
+    api
+      .getWorkRecordAnnotationTargets(subjectId)
+      .then((targets) => {
+        if (active) setStoredAnnotationTargets(targets);
+      })
+      .catch(() => {
+        if (active) setStoredAnnotationTargets([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [api, selectedWorkRecord?.subjectId]);
+
+  const annotationTargets = useMemo(() => {
+    if (!selectedWorkRecord) return [];
+    const targets = new Map<string, AnnotationTarget>(
+      storedAnnotationTargets.map((target) => [target.subjectId, target]),
+    );
+    for (const index of indexes) {
+      for (const project of index.projects) {
+        for (const record of project.records ?? []) {
+          if (record.subjectId === selectedWorkRecord.subjectId) continue;
+          targets.set(record.subjectId, {
+            subjectId: record.subjectId,
+            label: `${record.displayName} · ${project.project.name}`,
+            exactLocatorKey: [
+              record.locator.formatId,
+              record.locator.projectId,
+              record.locator.adapterRecordKey,
+            ].join(":"),
+            available: true,
+          });
+        }
+      }
+    }
+    const disposition = selectedWorkRecord.record.annotation?.disposition;
+    if (disposition?.status === "superseded" && !targets.has(disposition.replacement)) {
+      targets.set(disposition.replacement, {
+        subjectId: disposition.replacement,
+        label: disposition.replacement,
+        exactLocatorKey: disposition.replacement,
+        available: false,
+      });
+    }
+    return [...targets.values()].sort((left, right) => left.label.localeCompare(right.label));
+  }, [indexes, selectedWorkRecord, storedAnnotationTargets]);
+
+  const updateSelectedAnnotation = async (command: AnnotationCommand) => {
+    const subjectId = selectedWorkRecord?.subjectId;
+    if (!subjectId || !api.updateWorkRecordAnnotation) {
+      setDetailError("Private annotation updates are unavailable in this build");
+      return;
+    }
+    try {
+      ++detailRequestRef.current;
+      setDetailError(null);
+      const annotation = await api.updateWorkRecordAnnotation(subjectId, command);
+      if (selectedWorkRecordRef.current?.subjectId !== subjectId) return;
+      const nextDetail = {
+        ...selectedWorkRecordRef.current,
+        record: { ...selectedWorkRecordRef.current.record, annotation },
+      };
+      selectedWorkRecordRef.current = nextDetail;
+      setSelectedWorkRecord(nextDetail);
+      setIndexes((current) =>
+        current.map((index) => ({
+          ...index,
+          projects: index.projects.map((project) => ({
+            ...project,
+            records: project.records?.map((record) =>
+              record.subjectId === subjectId ? { ...record, annotation } : record,
+            ),
+          })),
+        })),
+      );
+    } catch (cause) {
+      setDetailError(errorMessage(cause));
+    }
+  };
+
+  const selectedWorkRoot = selectedWorkRecord
+    ? indexes.find((index) => index.rootId === selectedWorkRecord.rootId)
+    : undefined;
   const selectedRoot = selectedArtifact
     ? indexes.find((index) => index.rootId === selectedArtifact.rootId)
     : undefined;
+
+  const runWorkRecordHandoff = async (action: "path" | "prompt" | "terminal") => {
+    if (!selectedWorkRecord || !selectedWorkRoot) return;
+    try {
+      setDetailError(null);
+      setHandoffNotice(null);
+      if (action === "path") {
+        if (!api.copyWorkRecordPath) throw new Error("Work Record path handoff is unavailable");
+        await api.copyWorkRecordPath(
+          selectedWorkRoot.rootId,
+          selectedWorkRecord.subjectId,
+          selectedWorkRecord.indexGeneration,
+        );
+        setHandoffNotice("Source path copied");
+      } else if (action === "prompt") {
+        if (!api.copyWorkRecordPrompt) throw new Error("Work Record prompt handoff is unavailable");
+        await api.copyWorkRecordPrompt(
+          selectedWorkRoot.rootId,
+          selectedWorkRecord.subjectId,
+          selectedWorkRecord.indexGeneration,
+        );
+        setHandoffNotice("Continuation prompt copied");
+      } else {
+        await api.openTerminal(selectedWorkRoot.rootId, selectedWorkRecord.projectId);
+        setHandoffNotice("Terminal opened at the project root");
+      }
+    } catch (cause) {
+      setDetailError(errorMessage(cause));
+    }
+  };
 
   const runHandoff = async (action: "path" | "prompt" | "terminal") => {
     if (!selectedArtifact || !selectedRoot) return;
@@ -776,20 +1201,25 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
   };
 
   const requestSummary = async () => {
-    if (!selectedArtifact) return;
-    const requestedBundleId = selectedArtifact.bundleId;
-    const root = indexes.find((index) => index.rootId === selectedArtifact.rootId);
+    const requestedId = selectedWorkRecord?.subjectId ?? selectedArtifact?.bundleId;
+    const rootId = selectedWorkRecord?.rootId ?? selectedArtifact?.rootId;
+    if (!requestedId || !rootId) return;
+    const root = indexes.find((index) => index.rootId === rootId);
     if (!root) return;
     const inventoryEpoch = inventoryEpochRef.current;
     const previous = generatedResult(generatedView);
+    const selectionIsCurrent = () =>
+      selectedWorkRecord
+        ? selectedWorkRecordRef.current?.subjectId === requestedId
+        : selectedArtifactRef.current?.bundleId === requestedId;
     setGeneratedView({ status: "generating", ...(previous ? { previous } : {}) });
     try {
-      const nextView = await api.requestSummary(root.rootId, requestedBundleId);
+      const nextView = await api.requestSummary(root.rootId, requestedId);
       if (inventoryEpoch !== inventoryEpochRef.current) return;
-      if (selectedArtifactRef.current?.bundleId === requestedBundleId) setGeneratedView(nextView);
+      if (selectionIsCurrent()) setGeneratedView(nextView);
       setGeneratedInventory((inventory) => ({
         ...inventory,
-        [requestedBundleId]: nextView,
+        [requestedId]: nextView,
       }));
     } catch (cause) {
       if (inventoryEpoch !== inventoryEpochRef.current) return;
@@ -798,17 +1228,18 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
         ...(previous ? { previous } : {}),
         failure: errorMessage(cause),
       };
-      if (selectedArtifactRef.current?.bundleId === requestedBundleId) setGeneratedView(failed);
+      if (selectionIsCurrent()) setGeneratedView(failed);
       setGeneratedInventory((inventory) => ({
         ...inventory,
-        [requestedBundleId]: failed,
+        [requestedId]: failed,
       }));
     }
   };
 
   useEffect(() => savePaneLayout(paneLayout), [paneLayout]);
 
-  const selectedReadingId = selectedMarkdown?.documentId ?? selectedArtifact?.bundleId;
+  const selectedReadingId =
+    selectedWorkRecord?.subjectId ?? selectedMarkdown?.documentId ?? selectedArtifact?.bundleId;
   useEffect(() => {
     if (selectedReadingId) readingDeskRef.current?.focus();
   }, [selectedReadingId]);
@@ -954,7 +1385,8 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
   useEffect(() => () => resizeCleanupRef.current?.(), []);
 
   const statusLabel = workspaceStatusLabel(status, warnings.length + failedPatternRootIds.length);
-  const hasSelection = selectedArtifact !== null || selectedMarkdown !== null;
+  const hasSelection =
+    selectedWorkRecord !== null || selectedArtifact !== null || selectedMarkdown !== null;
   const ledgerCollapsed = hasSelection && paneLayout.ledgerCollapsed;
   const ledgerToggleLabel = !hasSelection
     ? "Bundle ledger remains open until work is selected"
@@ -1254,6 +1686,27 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
                   {label}
                 </button>
               ))}
+              <label className="annotation-filter">
+                Private annotation
+                <select
+                  aria-label="Filter by private annotation"
+                  value={annotationFilter}
+                  onChange={(event) => setAnnotationFilter(event.target.value as AnnotationFilter)}
+                >
+                  <option value="all">All annotations</option>
+                  <option value="undecided">Undecided</option>
+                  <option value="approved">Approved</option>
+                  <option value="rejected">Rejected</option>
+                  <option value="applicable">Applicable</option>
+                  <option value="obsolete">Obsolete</option>
+                  <option value="superseded">Superseded</option>
+                  <option value="favorite">Favorite</option>
+                  <option value="todo">Todo</option>
+                  <option value="priority_low">Low priority</option>
+                  <option value="priority_medium">Medium priority</option>
+                  <option value="priority_high">High priority</option>
+                </select>
+              </label>
             </div>
             {status === "loading" && indexes.length === 0 ? (
               <ScanSkeleton />
@@ -1272,7 +1725,18 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
                   >
                     <h2 id={`ledger-group-${slug(group.label)}`}>{group.label}</h2>
                     {group.records.map((record) =>
-                      record.kind === "bundle" ? (
+                      record.kind === "record" ? (
+                        <WorkRecordRow
+                          key={record.id}
+                          indexed={record.record}
+                          now={currentTime}
+                          selected={
+                            selectedWorkRecord?.subjectId === record.record.record.subjectId
+                          }
+                          onSelect={() => void selectWorkRecord(record.record)}
+                          onNavigate={navigateLedgerRows}
+                        />
+                      ) : record.kind === "bundle" ? (
                         <BundleRow
                           key={record.id}
                           bundle={record.bundle}
@@ -1338,7 +1802,50 @@ export function App({ api = runtimeApi, clock = systemClock }: AppProps) {
             data-pane="3"
             tabIndex={0}
           >
-            {selectedArtifact ? (
+            {selectedWorkRecord ? (
+              <>
+                <WorkRecordReadingDesk
+                  detail={selectedWorkRecord}
+                  annotationTargets={annotationTargets}
+                  onUpdateAnnotation={(command) => void updateSelectedAnnotation(command)}
+                  onOpenAnnotationTarget={(subjectId) => {
+                    for (const index of indexes) {
+                      for (const project of index.projects) {
+                        const target = project.records?.find(
+                          (record) => record.subjectId === subjectId,
+                        );
+                        if (target) {
+                          void selectWorkRecord({
+                            rootId: index.rootId,
+                            indexGeneration: index.generation,
+                            project: project.project,
+                            record: target,
+                            generationSupported: project.bundles.some((bundle) =>
+                              samePaths(
+                                target.sources.map((source) => source.relativePath),
+                                bundle.bundle.members.map((member) => member.relativePath),
+                              ),
+                            ),
+                          });
+                          return;
+                        }
+                      }
+                    }
+                  }}
+                  onCopyPath={() => void runWorkRecordHandoff("path")}
+                  onCopyPrompt={() => void runWorkRecordHandoff("prompt")}
+                  onOpenTerminal={() => void runWorkRecordHandoff("terminal")}
+                  onRescan={async () => {
+                    await scan(roots);
+                  }}
+                />
+                {recordSupportsGeneration(
+                  indexes,
+                  selectedWorkRecord.rootId,
+                  selectedWorkRecord.subjectId,
+                ) && <GeneratedSummary view={generatedView} onRequest={requestSummary} />}
+              </>
+            ) : selectedArtifact ? (
               <ArtifactReadingDesk
                 detail={selectedArtifact}
                 generatedView={generatedView}
@@ -2593,6 +3100,84 @@ function generatedStatusLabel(view: GeneratedView) {
   }
 }
 
+function WorkRecordRow({
+  indexed,
+  now,
+  selected,
+  onSelect,
+  onNavigate,
+}: {
+  indexed: IndexedWorkRecord;
+  now: Date;
+  selected: boolean;
+  onSelect: () => void;
+  onNavigate: (event: ReactKeyboardEvent<HTMLButtonElement>) => void;
+}) {
+  const { record, project } = indexed;
+  const sourceDate = formatLedgerDate(record.sourceModifiedUnixNanos, now);
+  const status = recordFactText(record, "openspec.primary_status");
+  const open = recordFactCount(record, "openspec.task.open_count");
+  const done = recordFactCount(record, "openspec.task.done_count");
+  const warningCount = record.warnings.length;
+  const annotation = record.annotation ?? defaultRecordAnnotation();
+  return (
+    <button
+      className={`bundle-row work-record-row ${selected ? "is-selected" : ""}`}
+      type="button"
+      data-ledger-row="true"
+      aria-pressed={selected}
+      onClick={onSelect}
+      onKeyDown={onNavigate}
+    >
+      <span className="bundle-row-top">
+        <span className={`bundle-kind bundle-kind--${record.locator.formatId}`}>
+          {record.recognition.level === "plain"
+            ? "Markdown document"
+            : record.locator.formatId === "openspec"
+              ? "OpenSpec"
+              : record.locator.formatId === "wayfinder-local"
+                ? "Wayfinder"
+                : "Planning candidate"}
+        </span>
+        {warningCount > 0 && (
+          <span className="bundle-warning">
+            {warningCount} {warningCount === 1 ? "warning" : "warnings"}
+          </span>
+        )}
+      </span>
+      <strong>{record.displayName}</strong>
+      <span className="annotation-badges" aria-label="Private annotations">
+        <span>{titleCase(annotation.decision)}</span>
+        <span>{titleCase(annotation.disposition.status)}</span>
+        {annotation.favorite && <span>Favorite</span>}
+        {annotation.todo && <span>Todo</span>}
+        {annotation.priority && <span>{titleCase(annotation.priority)} priority</span>}
+      </span>
+      <span className="bundle-primary-meta">
+        <span>
+          {isOpenSpecStatus(status) && (
+            <strong className="bundle-lifecycle">{primaryStatusLabel(status)}</strong>
+          )}
+          {open !== null && done !== null && (
+            <span className="bundle-task-counts">
+              {open} open · {done} done
+            </span>
+          )}
+          {record.recognition.level === "possible" && (
+            <span className="bundle-provenance">
+              {record.recognition.evidence[0] ?? "Matched configured planning pattern"}
+            </span>
+          )}
+        </span>
+        <time dateTime={sourceDate.dateTime} aria-label={sourceDate.full} title={sourceDate.full}>
+          {sourceDate.concise}
+        </time>
+      </span>
+      <small>{project.name}</small>
+    </button>
+  );
+}
+
 function DocumentRow({
   document,
   now,
@@ -2770,6 +3355,110 @@ function primaryStatusLabel(status: OpenSpecPrimaryStatus) {
   return status[0]!.toUpperCase() + status.slice(1);
 }
 
+function samePaths(left: string[], right: string[]) {
+  if (left.length !== right.length) return false;
+  const expected = new Set(left);
+  return expected.size === right.length && right.every((path) => expected.has(path));
+}
+
+function recordSupportsGeneration(indexes: IndexSnapshot[], rootId: string, subjectId: string) {
+  for (const index of indexes) {
+    if (index.rootId !== rootId) continue;
+    for (const project of index.projects) {
+      const record = project.records?.find((candidate) => candidate.subjectId === subjectId);
+      if (
+        record &&
+        project.bundles.some((bundle) =>
+          samePaths(
+            record.sources.map((source) => source.relativePath),
+            bundle.bundle.members.map((member) => member.relativePath),
+          ),
+        )
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function defaultRecordAnnotation(): WorkRecordAnnotation {
+  return {
+    decision: "undecided",
+    disposition: { status: "applicable" },
+    favorite: false,
+    todo: false,
+    priority: null,
+  };
+}
+
+function recordMatchesAnnotation(record: WorkRecord, filter: AnnotationFilter) {
+  if (filter === "all") return true;
+  const annotation = record.annotation ?? defaultRecordAnnotation();
+  if (filter === "undecided" || filter === "approved" || filter === "rejected") {
+    return annotation.decision === filter;
+  }
+  if (filter === "applicable" || filter === "obsolete" || filter === "superseded") {
+    return annotation.disposition.status === filter;
+  }
+  if (filter === "favorite") return annotation.favorite;
+  if (filter === "todo") return annotation.todo;
+  return annotation.priority === filter.replace("priority_", "");
+}
+
+function recordInScope(record: WorkRecord, scope: RegistryScope) {
+  return scope === "markdown" || record.recognition.level !== "plain";
+}
+
+function recordSearchText(record: WorkRecord, project: Project) {
+  return [
+    record.displayName,
+    project.name,
+    record.locator.formatId,
+    record.locator.adapterRecordKey,
+    ...record.sources.map((source) => source.relativePath),
+    ...record.facts.flatMap((fact) => [fact.key, fact.label, String(fact.value.value)]),
+  ]
+    .join(" ")
+    .toLowerCase();
+}
+
+function recordFactText(record: WorkRecord, key: string) {
+  const value = record.facts.find((fact) => fact.key === key)?.value;
+  return value?.type === "text" ? value.value : null;
+}
+
+function recordFactCount(record: WorkRecord, key: string) {
+  const value = record.facts.find((fact) => fact.key === key)?.value;
+  return value?.type === "count" ? value.value : null;
+}
+
+function isOpenSpecStatus(value: string | null): value is OpenSpecPrimaryStatus {
+  return value === "active" || value === "done" || value === "archived";
+}
+
+function recordMatchesFilter(
+  record: WorkRecord,
+  filter: BundleFilter,
+  generatedInventory: Record<string, GeneratedView>,
+) {
+  const status = recordFactText(record, "openspec.primary_status");
+  switch (filter) {
+    case "current":
+      return status !== "archived";
+    case "active":
+      return status === "active";
+    case "done":
+      return status === "done";
+    case "archived":
+      return status === "archived";
+    case "warning":
+      return record.warnings.length > 0;
+    case "stale":
+      return generatedInventory[record.subjectId]?.status === "stale";
+  }
+}
+
 function bundleMatchesFilter(
   bundle: IndexedBundle,
   filter: BundleFilter,
@@ -2827,6 +3516,10 @@ function navigateLedgerRows(event: ReactKeyboardEvent<HTMLButtonElement>) {
   if (!next) return;
   event.preventDefault();
   next.focus();
+}
+
+function titleCase(value: string) {
+  return value[0]!.toUpperCase() + value.slice(1).replaceAll("_", " ");
 }
 
 function slug(value: string) {

@@ -1,10 +1,15 @@
 use std::path::{Path, PathBuf};
 
 use backstage_core::{
-    ArtifactBundle, ArtifactRecognition, BundleKind, DetectorEvidence, EvidenceKind,
-    MarkdownDocument, OpenSpecCustody, OpenSpecPrimaryStatus, OpenSpecProgress, OpenSpecSource,
-    OpenSpecView, ParseWarning, ParserProvenance, PlanningPattern, ProgressFallback, SnapshotError,
-    assess_openspec_status, build_openspec_view, canonical_planning_patterns, classify_project,
+    AdapterHandoff, AdapterSummary, ArtifactBundle, ArtifactRecognition, BundleKind,
+    CapabilityView, DetectedRecord, DetectedWorkRecord, DetectorEvidence, EvidenceKind,
+    FormatRegistry, MarkdownAdapter, MarkdownDocument, OpenSpecAdapter, OpenSpecCustody,
+    OpenSpecPrimaryStatus, OpenSpecProgress, OpenSpecSource, OpenSpecView, ParseWarning,
+    ParserProvenance, PlanningFormatAdapter, PlanningPattern, PlanningPatternAdapter,
+    ProgressFallback, ProjectSourceInventory, RecordSourceCapture, SnapshotError,
+    SourceCaptureFailure, SourceClaim, SourceInventoryEntry, SourceSnapshot, SubjectId,
+    WayfinderLocalAdapter, WorkRecord, WorkRecordWarning, assess_openspec_status,
+    build_openspec_view, canonical_planning_patterns, classify_project,
     fingerprint_complete_snapshots, is_supported_openspec_member, matching_planning_patterns,
     parse_openspec_tasks,
 };
@@ -12,7 +17,7 @@ use serde::Serialize;
 
 use crate::discovery::{CancellationToken, ProjectCandidate, ScanPolicy, ScanWarning};
 use crate::filesystem::ContainedReader;
-use crate::index::{IndexSnapshot, IndexedBundle, IndexedProject};
+use crate::index::{CURRENT_INDEX_SCHEMA_VERSION, IndexSnapshot, IndexedBundle, IndexedProject};
 
 pub fn build_index(
     reader: &ContainedReader,
@@ -154,6 +159,7 @@ fn build_index_controlled_with_patterns_and_checkpoint(
         }
     }
     IndexSnapshot {
+        schema_version: CURRENT_INDEX_SCHEMA_VERSION,
         root_id: backstage_core::ApprovedRoot::new(reader.root(), true)
             .expect("contained reader root is a canonical directory")
             .id()
@@ -185,7 +191,7 @@ fn index_project(
     );
     let mut bundles = Vec::new();
     if budget.stop_reason().is_none() {
-        for bundle in classify_project(&project.id, &project.name, detected.evidence) {
+        for bundle in classify_project(&project.id, &project.name, detected.evidence.clone()) {
             checkpoint(CatalogCheckpoint::BeforeBundle);
             if budget.stop_reason().is_some() {
                 break;
@@ -204,12 +210,41 @@ fn index_project(
             }
         }
     }
+
+    let registry = FormatRegistry::new(vec![
+        Box::new(OpenSpecAdapter::new()),
+        Box::new(WayfinderLocalAdapter::new()),
+        Box::new(PlanningPatternAdapter::new(patterns.to_vec())),
+        Box::new(MarkdownAdapter::new()),
+    ]);
+    let registry_detection = registry.detect(&detected.inventory);
+    let source_count = registry_detection.source_count;
+    let registry_warnings = registry_detection.warnings;
+    let mut records = Vec::new();
+    for record in registry_detection.records {
+        checkpoint(CatalogCheckpoint::BeforeBundle);
+        let (indexed, _) = index_work_record(
+            reader,
+            &project,
+            &detected.inventory,
+            &registry,
+            record,
+            &budget,
+            checkpoint,
+        );
+        if let Some(indexed) = indexed {
+            records.push(indexed);
+        }
+    }
     let stopped = budget.stop_reason();
     (
         IndexedProject {
             project,
             bundles,
             markdown_documents: detected.markdown_documents,
+            records,
+            source_count,
+            registry_warnings,
         },
         stopped,
     )
@@ -275,6 +310,7 @@ fn partial_warning(reason: ScanStopReason, path: &Path, policy: &ScanPolicy) -> 
 struct DetectedProjectContent {
     evidence: Vec<DetectorEvidence>,
     markdown_documents: Vec<MarkdownDocument>,
+    inventory: ProjectSourceInventory,
 }
 
 fn detect_project_content(
@@ -287,6 +323,7 @@ fn detect_project_content(
 ) -> DetectedProjectContent {
     let mut evidence = Vec::new();
     let mut markdown_documents = Vec::new();
+    let mut inventory_sources = Vec::new();
     let excluded = policy.exclusions.iter().cloned().collect();
     for entry in reader.walk_from(
         project_root,
@@ -311,15 +348,16 @@ fn detect_project_content(
         if !is_markdown(&relative) {
             continue;
         }
-        let Ok(source_modified_unix_nanos) = reader.regular_file_modified_unix_nanos(&path) else {
+        let Ok(observation) = reader.regular_file_observation(&path) else {
             continue;
         };
         markdown_documents.push(MarkdownDocument::new(
             &project.id,
             &project.name,
             &relative,
-            source_modified_unix_nanos,
+            observation.modified_unix_nanos,
         ));
+        inventory_sources.push(SourceInventoryEntry::new(relative.clone(), observation));
         if is_supported_openspec_member(&relative) {
             evidence.push(DetectorEvidence::new(
                 relative,
@@ -350,6 +388,11 @@ fn detect_project_content(
     DetectedProjectContent {
         evidence,
         markdown_documents,
+        inventory: ProjectSourceInventory::new(
+            project.id.clone(),
+            project.name.clone(),
+            inventory_sources,
+        ),
     }
 }
 
@@ -358,6 +401,60 @@ fn is_markdown(relative: &str) -> bool {
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+}
+
+fn index_work_record(
+    reader: &ContainedReader,
+    project: &ProjectCandidate,
+    inventory: &ProjectSourceInventory,
+    registry: &FormatRegistry,
+    record: DetectedWorkRecord,
+    budget: &ProjectScanBudget<'_>,
+    checkpoint: &mut impl FnMut(CatalogCheckpoint),
+) -> (Option<WorkRecord>, bool) {
+    let mut snapshots = Vec::new();
+    let mut failures = Vec::new();
+    let mut complete = true;
+    for claim in &record.claims {
+        checkpoint(CatalogCheckpoint::BeforeMember);
+        if budget.stop_reason().is_some() {
+            complete = false;
+            break;
+        }
+        let absolute = Path::new(&project.root_path).join(&claim.relative_path);
+        match capture_project_snapshot(reader, &absolute, &claim.relative_path) {
+            Ok(snapshot) => snapshots.push(snapshot),
+            Err(failure) => failures.push(failure),
+        }
+    }
+    let capture = RecordSourceCapture::partial(snapshots, failures);
+    (
+        registry.summarize(inventory, &record, &capture).ok(),
+        complete,
+    )
+}
+
+fn capture_project_snapshot(
+    reader: &ContainedReader,
+    absolute_path: &Path,
+    project_relative_path: &str,
+) -> Result<SourceSnapshot, SourceCaptureFailure> {
+    let snapshot = reader.read_snapshot(absolute_path).map_err(|error| {
+        SourceCaptureFailure::new(
+            project_relative_path,
+            "source_unavailable",
+            format!("Source could not be captured safely: {error}"),
+        )
+    })?;
+    snapshot
+        .with_relative_path(project_relative_path)
+        .map_err(|error| {
+            SourceCaptureFailure::new(
+                project_relative_path,
+                "source_path_invalid",
+                format!("Source path could not be normalized safely: {error}"),
+            )
+        })
 }
 
 fn index_bundle(
@@ -451,6 +548,178 @@ fn index_bundle(
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct WorkRecordDetail {
+    pub root_id: String,
+    pub subject_id: SubjectId,
+    pub index_generation: u64,
+    pub project_id: String,
+    pub project_name: String,
+    pub project_root: String,
+    pub git: Option<crate::discovery::GitContext>,
+    pub record: WorkRecord,
+    pub capabilities: Vec<CapabilityView>,
+    pub fingerprint: Option<backstage_core::SourceFingerprint>,
+    pub warnings: Vec<WorkRecordWarning>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkRecordHandoffDetail {
+    pub root_id: String,
+    pub subject_id: SubjectId,
+    pub index_generation: u64,
+    pub handoff: AdapterHandoff,
+}
+
+pub fn work_record_detail(
+    reader: &ContainedReader,
+    index: &IndexSnapshot,
+    subject_id: &str,
+) -> Result<WorkRecordDetail, CatalogError> {
+    let (project, record) = find_work_record(index, subject_id)?;
+    let adapter = adapter_for_record(record)?;
+    let detected = detected_record(record);
+    let capture = capture_work_record_sources(reader, project, record);
+    let capabilities = adapter
+        .build_detail(&detected, &capture)
+        .map_err(|error| CatalogError::Read(error.to_string()))?;
+    let AdapterSummary {
+        facts,
+        warnings: summary_warnings,
+        capabilities: summary_capabilities,
+        fingerprint,
+    } = adapter
+        .summarize(&detected, &capture)
+        .map_err(|error| CatalogError::Read(error.to_string()))?;
+    let mut warnings = record
+        .warnings
+        .iter()
+        .filter(|warning| warning.code == "adapter_claim_overlap")
+        .cloned()
+        .collect::<Vec<_>>();
+    warnings.extend(summary_warnings);
+    warnings.extend(capture.failures.iter().map(|failure| {
+        WorkRecordWarning::new(
+            failure.code.clone(),
+            failure.message.clone(),
+            Some(failure.relative_path.clone()),
+        )
+    }));
+    warnings.sort();
+    warnings.dedup();
+    let mut fresh_record = record.clone();
+    fresh_record.facts = facts;
+    fresh_record.capabilities = summary_capabilities;
+    fresh_record.warnings = warnings.clone();
+    fresh_record.fingerprint = fingerprint.clone();
+    for source in &mut fresh_record.sources {
+        if let Some(snapshot) = capture.snapshot(&source.relative_path) {
+            source.source_modified_unix_nanos = snapshot.observation().modified_unix_nanos;
+        }
+    }
+    fresh_record.source_modified_unix_nanos = fresh_record
+        .sources
+        .iter()
+        .filter_map(|source| source.source_modified_unix_nanos)
+        .max();
+    Ok(WorkRecordDetail {
+        root_id: index.root_id.clone(),
+        subject_id: record.subject_id.clone(),
+        index_generation: index.generation,
+        project_id: project.project.id.clone(),
+        project_name: project.project.name.clone(),
+        project_root: project.project.root_path.clone(),
+        git: project.project.git.clone(),
+        record: fresh_record,
+        capabilities,
+        fingerprint,
+        warnings,
+    })
+}
+
+pub fn work_record_handoff(
+    reader: &ContainedReader,
+    index: &IndexSnapshot,
+    subject_id: &str,
+) -> Result<WorkRecordHandoffDetail, CatalogError> {
+    let (project, record) = find_work_record(index, subject_id)?;
+    let adapter = adapter_for_record(record)?;
+    let detected = detected_record(record);
+    let capture = capture_work_record_sources(reader, project, record);
+    let handoff = adapter
+        .build_handoff(&detected, &capture)
+        .map_err(|error| CatalogError::Read(error.to_string()))?;
+    Ok(WorkRecordHandoffDetail {
+        root_id: index.root_id.clone(),
+        subject_id: record.subject_id.clone(),
+        index_generation: index.generation,
+        handoff,
+    })
+}
+
+fn find_work_record<'a>(
+    index: &'a IndexSnapshot,
+    subject_id: &str,
+) -> Result<(&'a IndexedProject, &'a WorkRecord), CatalogError> {
+    index
+        .projects
+        .iter()
+        .find_map(|project| {
+            project
+                .records
+                .iter()
+                .find(|record| record.subject_id.as_str() == subject_id)
+                .map(|record| (project, record))
+        })
+        .ok_or(CatalogError::NotFound)
+}
+
+fn detected_record(record: &WorkRecord) -> DetectedRecord {
+    DetectedRecord::new(
+        record.locator.adapter_record_key.clone(),
+        record.display_name.clone(),
+        record.recognition.level,
+        record
+            .sources
+            .iter()
+            .map(|source| SourceClaim::new(source.relative_path.clone()))
+            .collect(),
+        record.recognition.evidence.clone(),
+        record.capabilities.clone(),
+    )
+}
+
+fn capture_work_record_sources(
+    reader: &ContainedReader,
+    project: &IndexedProject,
+    record: &WorkRecord,
+) -> RecordSourceCapture {
+    let mut snapshots = Vec::new();
+    let mut failures = Vec::new();
+    for source in &record.sources {
+        let absolute = Path::new(&project.project.root_path).join(&source.relative_path);
+        match capture_project_snapshot(reader, &absolute, &source.relative_path) {
+            Ok(snapshot) => snapshots.push(snapshot),
+            Err(failure) => failures.push(failure),
+        }
+    }
+    RecordSourceCapture::partial(snapshots, failures)
+}
+
+fn adapter_for_record(record: &WorkRecord) -> Result<Box<dyn PlanningFormatAdapter>, CatalogError> {
+    match record.locator.format_id.as_str() {
+        "openspec" => Ok(Box::new(OpenSpecAdapter::new())),
+        "wayfinder-local" => Ok(Box::new(WayfinderLocalAdapter::new())),
+        "planning-pattern" => Ok(Box::new(PlanningPatternAdapter::new(vec![]))),
+        "markdown" => Ok(Box::new(MarkdownAdapter::new())),
+        format_id => Err(CatalogError::Read(format!(
+            "No compiled adapter is available for format {format_id}"
+        ))),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MarkdownDetail {
     pub root_id: String,
     pub document_id: String,
@@ -525,6 +794,8 @@ pub fn live_bundle_state(
     for member in &bundle.members {
         let snapshot = reader
             .read_snapshot(project_root.join(&member.relative_path))
+            .map_err(|error| CatalogError::Read(error.to_string()))?
+            .with_relative_path(&member.relative_path)
             .map_err(|error| CatalogError::Read(error.to_string()))?;
         if member.relative_path.ends_with("/tasks.md") || member.relative_path == "tasks.md" {
             if let Some(text) = snapshot.text() {
@@ -860,6 +1131,44 @@ mod tests {
                 .warnings
                 .iter()
                 .all(|warning| !warning.contains("could not be read"))
+        );
+    }
+
+    #[test]
+    fn stopped_captures_still_compose_every_safely_detected_source() {
+        let root = TempDir::new().expect("root");
+        let (reader, project, _, _) = detected_bundle(&root);
+        let cancellation = CancellationToken::new();
+        let policy = ScanPolicy::default();
+        let mut cancelled = false;
+
+        let index = build_index_controlled_with_patterns_and_checkpoint(
+            &reader,
+            vec![project],
+            1,
+            0,
+            "2026-08-13T12:00:00Z".to_owned(),
+            vec![],
+            &canonical_planning_patterns(),
+            &policy,
+            &cancellation,
+            |checkpoint| {
+                if !cancelled && matches!(checkpoint, CatalogCheckpoint::BeforeMember) {
+                    cancelled = true;
+                    cancellation.cancel();
+                }
+            },
+        );
+
+        assert_eq!(index.projects[0].source_count, 2);
+        assert_eq!(index.projects[0].records.len(), 1);
+        assert_eq!(index.projects[0].records[0].sources.len(), 2);
+        assert!(index.projects[0].records[0].fingerprint.is_none());
+        assert!(
+            index.projects[0].records[0]
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "openspec_progress_unavailable")
         );
     }
 

@@ -1,7 +1,10 @@
-use backstage_app_lib::index::{CompletionDisposition, IndexSnapshot, ScanCoordinator};
+use backstage_app_lib::index::{
+    CURRENT_INDEX_SCHEMA_VERSION, CompletionDisposition, IndexSnapshot, ScanCoordinator,
+};
 
 fn snapshot(root_id: &str, generation: u64) -> IndexSnapshot {
     IndexSnapshot {
+        schema_version: CURRENT_INDEX_SCHEMA_VERSION,
         root_id: root_id.to_owned(),
         generation,
         indexed_at: format!("generation-{generation}"),

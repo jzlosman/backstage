@@ -43,6 +43,14 @@ impl SourceSnapshot {
         &self.relative_path
     }
 
+    pub fn with_relative_path(
+        mut self,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<Self, SnapshotError> {
+        self.relative_path = normalize_relative(relative_path.as_ref())?;
+        Ok(self)
+    }
+
     pub fn content(&self) -> &[u8] {
         &self.content
     }

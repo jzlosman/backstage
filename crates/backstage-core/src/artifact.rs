@@ -244,18 +244,18 @@ fn member(project_id: &str, evidence: DetectorEvidence) -> ArtifactMember {
 }
 
 #[derive(Clone)]
-struct OpenSpecLocation {
-    directory: String,
+pub(crate) struct OpenSpecLocation {
+    pub(crate) directory: String,
     identity: String,
-    display_name: String,
-    custody: OpenSpecCustody,
+    pub(crate) display_name: String,
+    pub(crate) custody: OpenSpecCustody,
 }
 
 pub fn is_supported_openspec_member(path: &str) -> bool {
     openspec_location(path).is_some()
 }
 
-fn openspec_location(path: &str) -> Option<OpenSpecLocation> {
+pub(crate) fn openspec_location(path: &str) -> Option<OpenSpecLocation> {
     if path.starts_with('/') || path.contains('\\') {
         return None;
     }

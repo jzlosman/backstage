@@ -21,15 +21,17 @@ You can use it to:
 - Find planning work across approved local folders.
 - Add and remove approved folders from an app-owned Settings view.
 - Read current and archived OpenSpec changes as an overview, task list, or exact source.
-- Distinguish Active, Done, and Archived changes while keeping task progress separate.
+- Read local-Markdown Wayfinder efforts as an overview, question register, deterministic frontier, or exact source.
+- Distinguish Active, Done, and Archived OpenSpec changes while keeping task progress separate.
+- Add private decisions, dispositions, favorites, todos, and priorities without changing repository files.
 - Find recently modified work first, grouped by local date ranges.
-- Check task progress from source checkboxes.
+- Check task progress and Wayfinder ticket state from deterministic source parsing.
 - Configure removable regular-expression patterns for planning Markdown paths.
 - Browse all safely indexed Markdown when a file is not planning work.
 - Copy an exact path or continuation prompt into a new agent session.
 - Ask Pi for a summary when you choose to send the source.
 
-Backstage groups recognized OpenSpec files. It does not claim to recognize Wayfinder folders, evidence folders, or every planning format. Files from those systems remain available as ordinary Markdown in **All Markdown** when they are within the scan bounds.
+Backstage uses a compiled-in, explicitly ordered format registry. Version 1 includes OpenSpec, local-Markdown Wayfinder, planning-pattern, and plain-Markdown adapters. These are built into the application; Backstage does not load repository-provided or runtime plugins. Unsupported material remains available as ordinary Markdown in **All Markdown** when it is within the scan bounds.
 
 ## Who it is for
 
@@ -57,8 +59,9 @@ The scanned repo stays unchanged throughout this flow.
 - Backstage sends source content to Pi only after an explicit request.
 - Pi generation never runs as a background classification step.
 - Generated summaries keep their source list and fingerprint. Backstage marks them stale when the source changes.
-- OpenSpec task progress comes from deterministic parsing, not from a model.
-- Parser failures leave the source readable and show a warning.
+- OpenSpec task progress and local Wayfinder frontier facts come from deterministic parsing, not from a model.
+- Private annotations live only in app-owned SQLite storage. Annotation-like repository frontmatter is ignored as private state.
+- Parser failures leave safely captured source readable and show a warning.
 - Backstage scans only roots that the user approves.
 - It rejects path traversal and links that escape an approved root.
 - App settings, indexes, and generated summaries live in app-owned folders.
@@ -71,6 +74,9 @@ The public preview includes:
 - Current and archived OpenSpec change bundles
 - Structured OpenSpec overview, task, and source views
 - Explicit Active, Done, and Archived status with open/done task counts
+- Local `.scratch/<effort>/map.md` Wayfinder overview, questions, answers, blockers, frontier, and source views
+- Private Undecided/Approved/Rejected decisions; Applicable/Obsolete/Superseded dispositions; favorite, todo, and optional priority
+- Cross-format private-annotation filters
 - Configurable planning-path patterns with removable plan, TDD, and roadmap defaults
 - App-owned approved-root management
 - Opt-in browsing of safely indexed Markdown
@@ -90,6 +96,9 @@ It does not include:
 - Pi session management
 - Guaranteed Superset deep links
 - Complete support for every planning format
+- Runtime or repository-provided format plugins
+- Remote issue-tracker discovery or synchronization
+- Private-annotation sync between Macs or users
 
 ## Platform and stack
 

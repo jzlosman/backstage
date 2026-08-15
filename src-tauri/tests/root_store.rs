@@ -1,7 +1,7 @@
 mod support;
 
 use backstage_app_lib::discovery::ProjectCandidate;
-use backstage_app_lib::index::{IndexSnapshot, IndexedProject};
+use backstage_app_lib::index::{CURRENT_INDEX_SCHEMA_VERSION, IndexSnapshot, IndexedProject};
 use backstage_app_lib::storage::{SqliteStore, StoreError};
 use backstage_app_lib::{approve_root_path, list_approved_roots, remove_approved_root};
 use backstage_core::{GeneratedResult, GenerationMode, SourceFingerprint};
@@ -41,6 +41,11 @@ fn root_approval_rejects_files_and_relative_paths_without_persisting() {
     fixture.assert_unchanged(&before);
 }
 
+fn subject_id(record_key: &str) -> backstage_core::SubjectId {
+    backstage_core::RecordLocator::new("project_shared", "planning-pattern", record_key)
+        .subject_id()
+}
+
 fn empty_index(root_id: &str, bundle_ids: &[&str]) -> IndexSnapshot {
     let bundles = bundle_ids
         .iter()
@@ -73,6 +78,7 @@ fn empty_index(root_id: &str, bundle_ids: &[&str]) -> IndexSnapshot {
         })
         .collect();
     IndexSnapshot {
+        schema_version: CURRENT_INDEX_SCHEMA_VERSION,
         root_id: root_id.to_owned(),
         generation: 1,
         indexed_at: "2026-08-14T00:00:00Z".to_owned(),
@@ -86,6 +92,36 @@ fn empty_index(root_id: &str, bundle_ids: &[&str]) -> IndexSnapshot {
             },
             bundles,
             markdown_documents: vec![],
+            records: bundle_ids
+                .iter()
+                .map(|record_key| {
+                    let descriptor = backstage_core::AdapterDescriptor::new(
+                        "planning-pattern-v1",
+                        "planning-pattern",
+                        1,
+                        30,
+                    );
+                    backstage_core::WorkRecord::new(
+                        backstage_core::RecordLocator::new(
+                            "project_shared",
+                            descriptor.format_id(),
+                            *record_key,
+                        ),
+                        format!("{record_key}.md"),
+                        backstage_core::WorkRecordRecognition::new(
+                            backstage_core::RecognitionLevel::Possible,
+                            &descriptor,
+                            vec!["test fixture".to_owned()],
+                        ),
+                        vec![],
+                        vec![],
+                        vec![],
+                        vec![backstage_core::Capability::new("source", "Source")],
+                    )
+                })
+                .collect(),
+            source_count: bundle_ids.len(),
+            registry_warnings: vec![],
         }],
         warnings: vec![],
     }
@@ -120,10 +156,10 @@ fn coordinated_removal_returns_authoritative_inventory_and_prunes_only_unreachab
         .save_index(&empty_index(second.id(), &["bundle_shared"]))
         .expect("second index");
     store
-        .save_generated_view("bundle_shared", &generated_result())
+        .save_generated_view(&subject_id("bundle_shared"), &generated_result())
         .expect("shared generated view");
     store
-        .save_generated_view("bundle_unique", &generated_result())
+        .save_generated_view(&subject_id("bundle_unique"), &generated_result())
         .expect("unique generated view");
 
     let inventory = store
@@ -141,13 +177,21 @@ fn coordinated_removal_returns_authoritative_inventory_and_prunes_only_unreachab
     );
     assert!(
         store
-            .find_latest_generated_view("bundle_shared", GenerationMode::Summary, "summary-v1")
+            .find_latest_generated_view(
+                &subject_id("bundle_shared"),
+                GenerationMode::Summary,
+                "summary-v1",
+            )
             .expect("shared lookup")
             .is_some()
     );
     assert!(
         store
-            .find_latest_generated_view("bundle_unique", GenerationMode::Summary, "summary-v1")
+            .find_latest_generated_view(
+                &subject_id("bundle_unique"),
+                GenerationMode::Summary,
+                "summary-v1",
+            )
             .expect("unique lookup")
             .is_none()
     );
@@ -169,7 +213,7 @@ fn removal_prefers_retained_current_indexes_when_pruning_generated_views() {
     let mut current_retained = empty_index(retained.id(), &["bundle_memory_only"]);
     current_retained.generation = 2;
     store
-        .save_generated_view("bundle_memory_only", &generated_result())
+        .save_generated_view(&subject_id("bundle_memory_only"), &generated_result())
         .expect("generated view");
 
     let inventory = store
@@ -179,7 +223,11 @@ fn removal_prefers_retained_current_indexes_when_pruning_generated_views() {
     assert_eq!(inventory.indexes, vec![current_retained]);
     assert!(
         store
-            .find_latest_generated_view("bundle_memory_only", GenerationMode::Summary, "summary-v1")
+            .find_latest_generated_view(
+                &subject_id("bundle_memory_only"),
+                GenerationMode::Summary,
+                "summary-v1",
+            )
             .expect("generated lookup")
             .is_some()
     );
@@ -210,7 +258,7 @@ fn removal_transaction_rolls_back_root_index_and_generated_views_on_database_fai
         .save_index(&empty_index(approved.id(), &["bundle_unique"]))
         .expect("index");
     store
-        .save_generated_view("bundle_unique", &generated_result())
+        .save_generated_view(&subject_id("bundle_unique"), &generated_result())
         .expect("generated view");
     let connection = rusqlite::Connection::open(&database).expect("second connection");
     connection
@@ -229,7 +277,11 @@ fn removal_transaction_rolls_back_root_index_and_generated_views_on_database_fai
     assert!(store.load_index(approved.id()).expect("index").is_some());
     assert!(
         store
-            .find_latest_generated_view("bundle_unique", GenerationMode::Summary, "summary-v1")
+            .find_latest_generated_view(
+                &subject_id("bundle_unique"),
+                GenerationMode::Summary,
+                "summary-v1",
+            )
             .expect("generated lookup")
             .is_some()
     );

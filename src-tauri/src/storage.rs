@@ -3,20 +3,28 @@ use std::fs;
 use std::path::Path;
 
 use backstage_core::{
-    ApprovedRoot, GeneratedResult, GenerationMode, PlanningPattern, PlanningPatternConfiguration,
-    PlanningPatternError, PlanningPatternProvenance, canonical_planning_patterns,
+    ApprovedRoot, Decision, Disposition, GeneratedResult, GenerationMode, PlanningPattern,
+    PlanningPatternConfiguration, PlanningPatternError, PlanningPatternProvenance, Priority,
+    SubjectId, WorkRecord, WorkRecordAnnotation, canonical_planning_patterns,
     validate_planning_pattern_count,
 };
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::index::{IndexPersistence, IndexSnapshot};
+use crate::index::{IndexPersistence, IndexSnapshot, migrate_legacy_snapshot};
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RootRemovalInventory {
     pub roots: Vec<ApprovedRoot>,
     pub indexes: Vec<IndexSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredWorkRecordSubject {
+    pub subject_id: SubjectId,
+    pub display_name: String,
+    pub exact_locator_key: String,
 }
 
 pub struct SqliteStore {
@@ -100,8 +108,35 @@ impl SqliteStore {
         if !exists {
             return Err(StoreError::RootNotFound(root_id.to_owned()));
         }
+        let known_subject_ids = {
+            let mut statement =
+                transaction.prepare("SELECT subject_id FROM work_record_subjects")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<BTreeSet<_>, _>>()?
+        };
 
         transaction.execute("DELETE FROM approved_roots WHERE id = ?1", [root_id])?;
+        transaction.execute(
+            "UPDATE work_record_annotations
+             SET disposition = 'obsolete', superseded_by_subject_id = NULL
+             WHERE superseded_by_subject_id IN (
+               SELECT subject_id FROM work_record_subjects
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM work_record_subject_roots
+                 WHERE work_record_subject_roots.subject_id = work_record_subjects.subject_id
+               )
+             )",
+            [],
+        )?;
+        transaction.execute(
+            "DELETE FROM work_record_subjects
+             WHERE NOT EXISTS (
+               SELECT 1 FROM work_record_subject_roots
+               WHERE work_record_subject_roots.subject_id = work_record_subjects.subject_id
+             )",
+            [],
+        )?;
         let roots = load_roots(&transaction)?;
         let retained_root_ids = roots
             .iter()
@@ -117,29 +152,204 @@ impl SqliteStore {
             }
         }
         let indexes = indexes.into_values().collect::<Vec<_>>();
-        let reachable_bundle_ids = indexes
-            .iter()
-            .flat_map(|index| &index.projects)
-            .flat_map(|project| &project.bundles)
-            .map(|bundle| bundle.bundle.id.clone())
-            .collect::<BTreeSet<_>>();
-        let cached_bundle_ids = {
+        let mut reachable_subject_ids = {
             let mut statement =
-                transaction.prepare("SELECT DISTINCT bundle_id FROM generated_views")?;
+                transaction.prepare("SELECT DISTINCT subject_id FROM work_record_subject_roots")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<BTreeSet<_>, _>>()?
+        };
+        reachable_subject_ids.extend(
+            indexes
+                .iter()
+                .flat_map(|index| &index.projects)
+                .flat_map(|project| &project.records)
+                .map(|record| record.subject_id.as_str().to_owned())
+                .filter(|subject_id| !known_subject_ids.contains(subject_id)),
+        );
+        let cached_subject_ids = {
+            let mut statement =
+                transaction.prepare("SELECT DISTINCT subject_id FROM generated_views")?;
             statement
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        for bundle_id in cached_bundle_ids {
-            if !reachable_bundle_ids.contains(&bundle_id) {
+        for subject_id in cached_subject_ids {
+            if !reachable_subject_ids.contains(&subject_id) {
                 transaction.execute(
-                    "DELETE FROM generated_views WHERE bundle_id = ?1",
-                    [bundle_id],
+                    "DELETE FROM generated_views WHERE subject_id = ?1",
+                    [subject_id],
                 )?;
             }
         }
         transaction.commit()?;
         Ok(RootRemovalInventory { roots, indexes })
+    }
+
+    pub fn refresh_work_record_subjects(
+        &self,
+        root_id: &str,
+        records: &[WorkRecord],
+        seen_at: &str,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        for record in records {
+            transaction.execute(
+                "INSERT INTO work_record_subjects (
+                   subject_id, project_id, format_id, adapter_record_key,
+                   last_known_name, last_seen_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(subject_id) DO UPDATE SET
+                   project_id = excluded.project_id,
+                   format_id = excluded.format_id,
+                   adapter_record_key = excluded.adapter_record_key,
+                   last_known_name = excluded.last_known_name,
+                   last_seen_at = excluded.last_seen_at",
+                params![
+                    record.subject_id.as_str(),
+                    record.locator.project_id,
+                    record.locator.format_id,
+                    record.locator.adapter_record_key,
+                    record.display_name,
+                    seen_at,
+                ],
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO work_record_subject_roots (subject_id, root_id)
+                 VALUES (?1, ?2)",
+                params![record.subject_id.as_str(), root_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn list_work_record_subjects(&self) -> Result<Vec<StoredWorkRecordSubject>, StoreError> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT subject_id, last_known_name,
+                        format_id || ':' || project_id || ':' || adapter_record_key
+                 FROM work_record_subjects ORDER BY last_known_name, subject_id",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map([], |row| {
+                let raw_id: String = row.get(0)?;
+                Ok(StoredWorkRecordSubject {
+                    subject_id: SubjectId::from_trusted(raw_id),
+                    display_name: row.get(1)?,
+                    exact_locator_key: row.get(2)?,
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Sqlite)
+    }
+
+    pub fn work_record_annotation(
+        &self,
+        subject_id: &SubjectId,
+    ) -> Result<WorkRecordAnnotation, StoreError> {
+        let row = self
+            .connection
+            .lock()
+            .query_row(
+                "SELECT decision, disposition, favorite, todo, priority,
+                        superseded_by_subject_id
+                 FROM work_record_annotations WHERE subject_id = ?1",
+                [subject_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, bool>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((decision, disposition, favorite, todo, priority, replacement)) = row else {
+            return Ok(WorkRecordAnnotation::default());
+        };
+        Ok(WorkRecordAnnotation {
+            decision: parse_decision(&decision)?,
+            disposition: parse_disposition(&disposition, replacement)?,
+            favorite,
+            todo,
+            priority: priority.as_deref().map(parse_priority).transpose()?,
+        })
+    }
+
+    pub fn save_work_record_annotation(
+        &self,
+        subject_id: &SubjectId,
+        annotation: &WorkRecordAnnotation,
+        updated_at: &str,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        if annotation == &WorkRecordAnnotation::default() {
+            transaction.execute(
+                "DELETE FROM work_record_annotations WHERE subject_id = ?1",
+                [subject_id.as_str()],
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
+        let (disposition, replacement) = match &annotation.disposition {
+            Disposition::Applicable => ("applicable", None),
+            Disposition::Obsolete => ("obsolete", None),
+            Disposition::Superseded { replacement } => ("superseded", Some(replacement.as_str())),
+        };
+        transaction.execute(
+            "INSERT INTO work_record_annotations (
+               subject_id, decision, disposition, favorite, todo, priority,
+               superseded_by_subject_id, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(subject_id) DO UPDATE SET
+               decision = excluded.decision,
+               disposition = excluded.disposition,
+               favorite = excluded.favorite,
+               todo = excluded.todo,
+               priority = excluded.priority,
+               superseded_by_subject_id = excluded.superseded_by_subject_id,
+               updated_at = excluded.updated_at",
+            params![
+                subject_id.as_str(),
+                decision_value(annotation.decision),
+                disposition,
+                annotation.favorite,
+                annotation.todo,
+                annotation.priority.map(priority_value),
+                replacement,
+                updated_at,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn supersession_edges(&self) -> Result<Vec<(SubjectId, SubjectId)>, StoreError> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT subject_id, superseded_by_subject_id
+             FROM work_record_annotations
+             WHERE disposition = 'superseded' AND superseded_by_subject_id IS NOT NULL
+             ORDER BY subject_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    SubjectId::from_trusted(row.get::<_, String>(0)?),
+                    SubjectId::from_trusted(row.get::<_, String>(1)?),
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     pub fn planning_configuration(&self) -> Result<PlanningPatternConfiguration, StoreError> {
@@ -253,8 +463,7 @@ impl SqliteStore {
                 |row| row.get::<_, String>(0),
             )
             .optional()?
-            .map(|payload| serde_json::from_str::<IndexSnapshot>(&payload))
-            .transpose()?;
+            .and_then(|payload| serde_json::from_str::<IndexSnapshot>(&payload).ok());
         if stored.as_ref().is_some_and(|stored| {
             (stored.configuration_revision, stored.generation)
                 > (snapshot.configuration_revision, snapshot.generation)
@@ -292,8 +501,18 @@ impl SqliteStore {
         let Some(payload) = payload else {
             return Ok(None);
         };
-        match serde_json::from_str(&payload) {
-            Ok(snapshot) => Ok(Some(snapshot)),
+        match serde_json::from_str::<IndexSnapshot>(&payload) {
+            Ok(mut snapshot) => {
+                let prior_version = snapshot.schema_version;
+                migrate_legacy_snapshot(&mut snapshot);
+                if snapshot.schema_version != prior_version {
+                    connection.execute(
+                        "UPDATE index_snapshots SET payload = ?1 WHERE root_id = ?2",
+                        params![serde_json::to_string(&snapshot)?, root_id],
+                    )?;
+                }
+                Ok(Some(snapshot))
+            }
             Err(_) => {
                 connection.execute("DELETE FROM index_snapshots WHERE root_id = ?1", [root_id])?;
                 Ok(None)
@@ -303,20 +522,20 @@ impl SqliteStore {
 
     pub fn save_generated_view(
         &self,
-        bundle_id: &str,
+        subject_id: &SubjectId,
         result: &GeneratedResult,
     ) -> Result<(), StoreError> {
         let mode = generation_mode(result.mode);
         let included_paths = serde_json::to_string(&result.included_paths)?;
         let cache_key = generated_cache_key(
-            bundle_id,
+            subject_id,
             mode,
             result.source_fingerprint.as_str(),
             &result.prompt_version,
         );
         self.connection.lock().execute(
             "INSERT INTO generated_views (
-               cache_key, bundle_id, mode, source_fingerprint, prompt_version,
+               cache_key, subject_id, mode, source_fingerprint, prompt_version,
                included_paths, generated_text, generated_at, model
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(cache_key) DO UPDATE SET
@@ -326,7 +545,7 @@ impl SqliteStore {
                model = excluded.model",
             params![
                 cache_key,
-                bundle_id,
+                subject_id.as_str(),
                 mode,
                 result.source_fingerprint.as_str(),
                 result.prompt_version,
@@ -341,14 +560,14 @@ impl SqliteStore {
 
     pub fn find_generated_view(
         &self,
-        bundle_id: &str,
+        subject_id: &SubjectId,
         mode: GenerationMode,
         source_fingerprint: &str,
         prompt_version: &str,
     ) -> Result<Option<GeneratedResult>, StoreError> {
         let mode_name = generation_mode(mode);
         let cache_key =
-            generated_cache_key(bundle_id, mode_name, source_fingerprint, prompt_version);
+            generated_cache_key(subject_id, mode_name, source_fingerprint, prompt_version);
         let connection = self.connection.lock();
         let row = connection
             .query_row(
@@ -363,7 +582,7 @@ impl SqliteStore {
 
     pub fn find_latest_generated_view(
         &self,
-        bundle_id: &str,
+        subject_id: &SubjectId,
         mode: GenerationMode,
         prompt_version: &str,
     ) -> Result<Option<GeneratedResult>, StoreError> {
@@ -372,9 +591,9 @@ impl SqliteStore {
             .query_row(
                 "SELECT source_fingerprint, included_paths, generated_text, generated_at, model
                  FROM generated_views
-                 WHERE bundle_id = ?1 AND mode = ?2 AND prompt_version = ?3
+                 WHERE subject_id = ?1 AND mode = ?2 AND prompt_version = ?3
                  ORDER BY generated_at DESC LIMIT 1",
-                params![bundle_id, generation_mode(mode), prompt_version],
+                params![subject_id.as_str(), generation_mode(mode), prompt_version],
                 generated_view_row,
             )
             .optional()?;
@@ -404,7 +623,7 @@ impl SqliteStore {
              );
              CREATE TABLE IF NOT EXISTS generated_views (
                cache_key TEXT PRIMARY KEY,
-               bundle_id TEXT NOT NULL,
+               subject_id TEXT NOT NULL,
                mode TEXT NOT NULL,
                source_fingerprint TEXT NOT NULL,
                prompt_version TEXT NOT NULL,
@@ -412,6 +631,38 @@ impl SqliteStore {
                generated_text TEXT NOT NULL,
                generated_at TEXT NOT NULL,
                model TEXT
+             );
+             CREATE TABLE IF NOT EXISTS work_record_subjects (
+               subject_id TEXT PRIMARY KEY,
+               project_id TEXT NOT NULL,
+               format_id TEXT NOT NULL,
+               adapter_record_key TEXT NOT NULL,
+               last_known_name TEXT NOT NULL,
+               last_seen_at TEXT NOT NULL,
+               UNIQUE(project_id, format_id, adapter_record_key)
+             );
+             CREATE TABLE IF NOT EXISTS work_record_subject_roots (
+               subject_id TEXT NOT NULL,
+               root_id TEXT NOT NULL,
+               PRIMARY KEY(subject_id, root_id),
+               FOREIGN KEY(subject_id) REFERENCES work_record_subjects(subject_id) ON DELETE CASCADE,
+               FOREIGN KEY(root_id) REFERENCES approved_roots(id) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS work_record_annotations (
+               subject_id TEXT PRIMARY KEY,
+               decision TEXT NOT NULL CHECK(decision IN ('undecided', 'approved', 'rejected')),
+               disposition TEXT NOT NULL CHECK(disposition IN ('applicable', 'obsolete', 'superseded')),
+               favorite INTEGER NOT NULL CHECK(favorite IN (0, 1)),
+               todo INTEGER NOT NULL CHECK(todo IN (0, 1)),
+               priority TEXT CHECK(priority IN ('low', 'medium', 'high')),
+               superseded_by_subject_id TEXT,
+               updated_at TEXT NOT NULL,
+               CHECK(
+                 (disposition = 'superseded' AND superseded_by_subject_id IS NOT NULL)
+                 OR (disposition != 'superseded' AND superseded_by_subject_id IS NULL)
+               ),
+               FOREIGN KEY(subject_id) REFERENCES work_record_subjects(subject_id) ON DELETE CASCADE,
+               FOREIGN KEY(superseded_by_subject_id) REFERENCES work_record_subjects(subject_id)
              );
              CREATE TABLE IF NOT EXISTS preferences (
                key TEXT PRIMARY KEY,
@@ -434,6 +685,7 @@ impl SqliteStore {
         )?;
 
         let transaction = connection.transaction()?;
+        migrate_generated_view_owners(&transaction)?;
         let seeded = transaction.query_row(
             "SELECT EXISTS(
                SELECT 1 FROM migration_markers WHERE name = 'planning-pattern-defaults-v1'
@@ -455,6 +707,125 @@ impl SqliteStore {
     }
 }
 
+fn migrate_generated_view_owners(connection: &Connection) -> Result<(), StoreError> {
+    let columns = {
+        let mut statement = connection.prepare("PRAGMA table_info(generated_views)")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<BTreeSet<_>, _>>()?
+    };
+    if columns.contains("subject_id") {
+        return Ok(());
+    }
+    if !columns.contains("bundle_id") {
+        return Err(StoreError::InvalidStoredConfiguration(
+            "generated view owner column is unavailable".to_owned(),
+        ));
+    }
+
+    let indexes = load_all_indexes(connection)?;
+    let mut owners = BTreeMap::new();
+    for index in &indexes {
+        for project in &index.projects {
+            for bundle in &project.bundles {
+                let member_paths = bundle
+                    .bundle
+                    .members
+                    .iter()
+                    .map(|member| member.relative_path.as_str())
+                    .collect::<BTreeSet<_>>();
+                let expected_format = match bundle.bundle.kind {
+                    backstage_core::BundleKind::OpenSpecChange => "openspec",
+                    backstage_core::BundleKind::PossibleArtifact => "planning-pattern",
+                };
+                if let Some(record) = project.records.iter().find(|record| {
+                    record.locator.format_id == expected_format
+                        && record
+                            .sources
+                            .iter()
+                            .map(|source| source.relative_path.as_str())
+                            .collect::<BTreeSet<_>>()
+                            == member_paths
+                }) {
+                    owners.insert(bundle.bundle.id.clone(), record.subject_id.clone());
+                }
+            }
+        }
+    }
+
+    let legacy_rows = {
+        let mut statement = connection.prepare(
+            "SELECT bundle_id, mode, source_fingerprint, prompt_version, included_paths,
+                    generated_text, generated_at, model
+             FROM generated_views",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    connection.execute_batch(
+        "CREATE TABLE generated_views_v2 (
+           cache_key TEXT PRIMARY KEY,
+           subject_id TEXT NOT NULL,
+           mode TEXT NOT NULL,
+           source_fingerprint TEXT NOT NULL,
+           prompt_version TEXT NOT NULL,
+           included_paths TEXT NOT NULL,
+           generated_text TEXT NOT NULL,
+           generated_at TEXT NOT NULL,
+           model TEXT
+         );",
+    )?;
+    for (
+        bundle_id,
+        mode,
+        source_fingerprint,
+        prompt_version,
+        included_paths,
+        generated_text,
+        generated_at,
+        model,
+    ) in legacy_rows
+    {
+        let Some(subject_id) = owners.get(&bundle_id) else {
+            continue;
+        };
+        connection.execute(
+            "INSERT OR REPLACE INTO generated_views_v2 (
+               cache_key, subject_id, mode, source_fingerprint, prompt_version,
+               included_paths, generated_text, generated_at, model
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                generated_cache_key(subject_id, &mode, &source_fingerprint, &prompt_version),
+                subject_id.as_str(),
+                mode,
+                source_fingerprint,
+                prompt_version,
+                included_paths,
+                generated_text,
+                generated_at,
+                model,
+            ],
+        )?;
+    }
+    connection.execute_batch(
+        "DROP TABLE generated_views;
+         ALTER TABLE generated_views_v2 RENAME TO generated_views;",
+    )?;
+    Ok(())
+}
+
 fn load_roots(connection: &Connection) -> Result<Vec<ApprovedRoot>, StoreError> {
     let mut statement = connection.prepare("SELECT path FROM approved_roots ORDER BY path")?;
     let paths = statement
@@ -470,15 +841,35 @@ fn load_roots(connection: &Connection) -> Result<Vec<ApprovedRoot>, StoreError> 
 }
 
 fn load_all_indexes(connection: &Connection) -> Result<Vec<IndexSnapshot>, StoreError> {
-    let mut statement =
-        connection.prepare("SELECT payload FROM index_snapshots ORDER BY root_id")?;
-    let payloads = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    payloads
-        .into_iter()
-        .map(|payload| serde_json::from_str(&payload).map_err(StoreError::from))
-        .collect()
+    let rows = {
+        let mut statement =
+            connection.prepare("SELECT root_id, payload FROM index_snapshots ORDER BY root_id")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut snapshots = Vec::new();
+    for (root_id, payload) in rows {
+        match serde_json::from_str::<IndexSnapshot>(&payload) {
+            Ok(mut snapshot) => {
+                let prior_version = snapshot.schema_version;
+                migrate_legacy_snapshot(&mut snapshot);
+                if snapshot.schema_version != prior_version {
+                    connection.execute(
+                        "UPDATE index_snapshots SET payload = ?1 WHERE root_id = ?2",
+                        params![serde_json::to_string(&snapshot)?, root_id],
+                    )?;
+                }
+                snapshots.push(snapshot);
+            }
+            Err(_) => {
+                connection.execute("DELETE FROM index_snapshots WHERE root_id = ?1", [root_id])?;
+            }
+        }
+    }
+    Ok(snapshots)
 }
 
 fn load_planning_configuration(
@@ -590,6 +981,57 @@ fn deserialize_generated_view(
     .transpose()
 }
 
+fn decision_value(decision: Decision) -> &'static str {
+    match decision {
+        Decision::Undecided => "undecided",
+        Decision::Approved => "approved",
+        Decision::Rejected => "rejected",
+    }
+}
+
+fn priority_value(priority: Priority) -> &'static str {
+    match priority {
+        Priority::Low => "low",
+        Priority::Medium => "medium",
+        Priority::High => "high",
+    }
+}
+
+fn parse_decision(value: &str) -> Result<Decision, StoreError> {
+    match value {
+        "undecided" => Ok(Decision::Undecided),
+        "approved" => Ok(Decision::Approved),
+        "rejected" => Ok(Decision::Rejected),
+        _ => Err(StoreError::InvalidStoredConfiguration(format!(
+            "annotation decision is invalid: {value}"
+        ))),
+    }
+}
+
+fn parse_priority(value: &str) -> Result<Priority, StoreError> {
+    match value {
+        "low" => Ok(Priority::Low),
+        "medium" => Ok(Priority::Medium),
+        "high" => Ok(Priority::High),
+        _ => Err(StoreError::InvalidStoredConfiguration(format!(
+            "annotation priority is invalid: {value}"
+        ))),
+    }
+}
+
+fn parse_disposition(value: &str, replacement: Option<String>) -> Result<Disposition, StoreError> {
+    match (value, replacement) {
+        ("applicable", None) => Ok(Disposition::Applicable),
+        ("obsolete", None) => Ok(Disposition::Obsolete),
+        ("superseded", Some(replacement)) => Ok(Disposition::Superseded {
+            replacement: SubjectId::from_trusted(replacement),
+        }),
+        _ => Err(StoreError::InvalidStoredConfiguration(format!(
+            "annotation disposition is invalid: {value}"
+        ))),
+    }
+}
+
 fn generation_mode(mode: GenerationMode) -> &'static str {
     match mode {
         GenerationMode::Summary => "summary",
@@ -597,14 +1039,19 @@ fn generation_mode(mode: GenerationMode) -> &'static str {
 }
 
 fn generated_cache_key(
-    bundle_id: &str,
+    subject_id: &SubjectId,
     mode: &str,
     fingerprint: &str,
     prompt_version: &str,
 ) -> String {
     use sha2::{Digest, Sha256};
-    let digest =
-        Sha256::digest(format!("{bundle_id}\0{mode}\0{fingerprint}\0{prompt_version}").as_bytes());
+    let digest = Sha256::digest(
+        format!(
+            "{}\0{mode}\0{fingerprint}\0{prompt_version}",
+            subject_id.as_str()
+        )
+        .as_bytes(),
+    );
     format!("generated_{digest:x}")
 }
 

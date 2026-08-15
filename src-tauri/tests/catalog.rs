@@ -4,7 +4,7 @@ use std::fs;
 
 use backstage_app_lib::catalog::{
     CatalogError, artifact_detail, build_index, build_index_controlled, build_index_with_patterns,
-    markdown_detail,
+    markdown_detail, work_record_detail, work_record_handoff,
 };
 use backstage_app_lib::discovery::{
     CancellationToken, ProjectCandidate, ScanPolicy, discover_projects,
@@ -13,6 +13,7 @@ use backstage_app_lib::filesystem::ContainedReader;
 use backstage_app_lib::{derive_artifact_path, derive_continuation_prompt, derive_markdown_path};
 use backstage_core::{
     BundleKind, OpenSpecCustody, OpenSpecPrimaryStatus, OpenSpecProgress, PlanningPattern,
+    RecognitionLevel, StructuredBlock,
 };
 use tempfile::TempDir;
 
@@ -79,6 +80,494 @@ fn catalog_recognizes_planning_work_and_indexes_all_markdown_separately() {
         }
     }
     fixture.assert_unchanged(&before);
+}
+
+#[test]
+fn catalog_composes_one_neutral_record_collection_with_complete_source_counts() {
+    let fixture = FixtureRepo::open_spec();
+    fs::write(fixture.path().join("notes.md"), "# Notes\n").expect("write notes");
+    let reader = ContainedReader::approve(fixture.path(), 1024 * 1024).expect("approve fixture");
+    let discovered = discover_projects(&reader, &ScanPolicy::default(), &CancellationToken::new());
+
+    let index = build_index(
+        &reader,
+        discovered.projects,
+        1,
+        "2026-08-13T12:00:00Z".to_owned(),
+        discovered.warnings,
+    );
+    let project = &index.projects[0];
+
+    assert_eq!(project.source_count, project.markdown_documents.len());
+    assert_eq!(project.source_count, 7);
+    assert_eq!(project.records.len(), 4);
+    let openspec = project
+        .records
+        .iter()
+        .find(|record| record.locator.format_id == "openspec")
+        .expect("neutral OpenSpec record");
+    assert_eq!(openspec.recognition.level, RecognitionLevel::Recognized);
+    assert_eq!(openspec.sources.len(), 4);
+    assert!(openspec.fingerprint.is_some());
+    assert_eq!(
+        openspec.source_modified_unix_nanos,
+        openspec
+            .sources
+            .iter()
+            .filter_map(|source| source.source_modified_unix_nanos)
+            .max()
+    );
+    assert!(project.records.iter().any(|record| {
+        record.recognition.level == RecognitionLevel::Possible
+            && record.sources[0].relative_path == "PLAN.md"
+    }));
+    assert!(project.records.iter().any(|record| {
+        record.recognition.level == RecognitionLevel::Plain
+            && record.sources[0].relative_path == "README.md"
+    }));
+    let represented = project
+        .records
+        .iter()
+        .flat_map(|record| {
+            record
+                .sources
+                .iter()
+                .map(|source| source.relative_path.as_str())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let discovered = project
+        .markdown_documents
+        .iter()
+        .map(|document| document.relative_path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(represented, discovered);
+}
+
+#[test]
+fn neutral_record_survives_a_partial_member_capture_with_source_warnings() {
+    let root = TempDir::new().expect("root tempdir");
+    let change = root.path().join("openspec/changes/partial");
+    fs::create_dir_all(&change).expect("change directory");
+    fs::write(change.join("proposal.md"), "## Why\n\nReadable.\n").expect("proposal");
+    fs::write(change.join("tasks.md"), vec![b'x'; 256]).expect("oversized tasks");
+    let reader = ContainedReader::approve(root.path(), 64).expect("approve root");
+    let discovered = discover_projects(&reader, &ScanPolicy::default(), &CancellationToken::new());
+
+    let index = build_index(
+        &reader,
+        discovered.projects,
+        1,
+        "2026-08-13T12:00:00Z".to_owned(),
+        discovered.warnings,
+    );
+    let record = index.projects[0]
+        .records
+        .iter()
+        .find(|record| record.locator.format_id == "openspec")
+        .expect("partial OpenSpec record");
+
+    assert_eq!(record.sources.len(), 2);
+    assert!(record.fingerprint.is_none());
+    assert!(record.warnings.iter().any(|warning| {
+        warning.source_path.as_deref() == Some("openspec/changes/partial/tasks.md")
+    }));
+    assert!(record.warnings.iter().any(|warning| {
+        warning.code == "incomplete_source_snapshot"
+            || warning.code == "openspec_progress_unavailable"
+    }));
+}
+
+#[test]
+fn neutral_detail_and_handoff_use_fresh_contained_sources() {
+    let fixture = FixtureRepo::open_spec();
+    let reader = ContainedReader::approve(fixture.path(), 1024 * 1024).expect("approve fixture");
+    let discovered = discover_projects(&reader, &ScanPolicy::default(), &CancellationToken::new());
+    let index = build_index(
+        &reader,
+        discovered.projects,
+        1,
+        "2026-08-13T12:00:00Z".to_owned(),
+        discovered.warnings,
+    );
+    let record = index.projects[0]
+        .records
+        .iter()
+        .find(|record| record.locator.format_id == "openspec")
+        .expect("OpenSpec record");
+    let indexed_fingerprint = record.fingerprint.clone();
+    fs::write(
+        fixture.path().join("openspec/changes/ship-search/tasks.md"),
+        "# Tasks\n\n- [x] Fresh task\n- [ ] Remaining task\n",
+    )
+    .expect("change tasks after indexing");
+
+    let detail = work_record_detail(&reader, &index, record.subject_id.as_str())
+        .expect("fresh neutral detail");
+    let handoff = work_record_handoff(&reader, &index, record.subject_id.as_str())
+        .expect("fresh neutral handoff");
+
+    assert_eq!(detail.subject_id, record.subject_id);
+    assert_eq!(detail.index_generation, 1);
+    assert_ne!(detail.fingerprint, indexed_fingerprint);
+    assert!(detail.record.facts.iter().any(|fact| {
+        fact.key == "openspec.task.done_count" && fact.value == backstage_core::FactValue::Count(1)
+    }));
+    assert!(detail.record.facts.iter().any(|fact| {
+        fact.key == "openspec.task.open_count" && fact.value == backstage_core::FactValue::Count(1)
+    }));
+    assert_eq!(
+        detail
+            .capabilities
+            .iter()
+            .map(|view| view.capability.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["overview", "tasks", "source"]
+    );
+    assert!(detail.capabilities[1].blocks.iter().any(|block| matches!(
+        block,
+        StructuredBlock::Progress {
+            completed: 1,
+            total: 2,
+            ..
+        }
+    )));
+    assert!(detail.capabilities[2].blocks.iter().any(|block| matches!(
+        block,
+        StructuredBlock::MarkdownSection { markdown, .. }
+            if markdown.contains("Fresh task")
+    )));
+    assert_eq!(
+        handoff.handoff.primary_source_path.as_deref(),
+        Some("openspec/changes/ship-search/tasks.md")
+    );
+    assert!(
+        handoff
+            .handoff
+            .continuation_prompt
+            .contains("Remaining task")
+    );
+}
+
+#[test]
+fn every_compiled_format_scan_detail_and_handoff_path_preserves_repository_bytes() {
+    let root = TempDir::new().expect("root");
+    let files = [
+        ("README.md", "# Ordinary\n"),
+        ("PLAN.md", "# Plan\n"),
+        (
+            "openspec/changes/change/proposal.md",
+            "## Why\n\nPreserve source.\n",
+        ),
+        (
+            "openspec/changes/change/tasks.md",
+            "# Tasks\n\n- [ ] Verify\n",
+        ),
+        (
+            ".scratch/effort/map.md",
+            "## Destination\nPreserve local Wayfinder source.\n",
+        ),
+        (
+            ".scratch/effort/issues/01-question.md",
+            "Type: research\n\n## Question\nIs source immutable?\n",
+        ),
+    ];
+    for (relative_path, contents) in files {
+        let path = root.path().join(relative_path);
+        fs::create_dir_all(path.parent().expect("parent")).expect("directory");
+        fs::write(path, contents).expect("fixture source");
+    }
+    let before = files
+        .iter()
+        .map(|(relative_path, _)| {
+            (
+                *relative_path,
+                fs::read(root.path().join(relative_path)).expect("before bytes"),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let reader = ContainedReader::approve(root.path(), 1024 * 1024).expect("reader");
+    let discovered = discover_projects(&reader, &ScanPolicy::default(), &CancellationToken::new());
+    let index = build_index(
+        &reader,
+        discovered.projects,
+        1,
+        "2026-08-13T12:00:00Z".to_owned(),
+        discovered.warnings,
+    );
+    let records = &index.projects[0].records;
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.locator.format_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "markdown",
+            "openspec",
+            "planning-pattern",
+            "wayfinder-local",
+        ])
+    );
+    for record in records {
+        work_record_detail(&reader, &index, record.subject_id.as_str()).expect("detail");
+        work_record_handoff(&reader, &index, record.subject_id.as_str()).expect("handoff");
+    }
+    let after = files
+        .iter()
+        .map(|(relative_path, _)| {
+            (
+                *relative_path,
+                fs::read(root.path().join(relative_path)).expect("after bytes"),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(after, before);
+}
+
+#[test]
+fn local_wayfinder_detail_and_handoff_use_fresh_contained_sources_without_mutation() {
+    let root = TempDir::new().expect("root");
+    let effort = root.path().join(".scratch/search");
+    fs::create_dir_all(effort.join("issues")).expect("effort");
+    let map_path = effort.join("map.md");
+    let ticket_path = effort.join("issues/01-first-question.md");
+    fs::write(&map_path, "## Destination\n\n").expect("map");
+    fs::write(
+        &ticket_path,
+        "Type: research\n\n## Question\nWhat should ship first?\n",
+    )
+    .expect("ticket");
+    let reader = ContainedReader::approve(root.path(), 1024 * 1024).expect("reader");
+    let discovered = discover_projects(&reader, &ScanPolicy::default(), &CancellationToken::new());
+    let index = build_index(
+        &reader,
+        discovered.projects,
+        1,
+        "2026-08-13T12:00:00Z".to_owned(),
+        discovered.warnings,
+    );
+    let record = index.projects[0]
+        .records
+        .iter()
+        .find(|record| record.locator.format_id == "wayfinder-local")
+        .expect("Wayfinder record");
+    assert_eq!(record.locator.adapter_record_key, ".scratch/search");
+    assert_eq!(record.sources.len(), 2);
+    assert!(record.facts.iter().any(|fact| {
+        fact.key == "wayfinder.frontier.count" && fact.value == backstage_core::FactValue::Count(1)
+    }));
+    assert!(
+        record
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "wayfinder_map_section_empty")
+    );
+
+    fs::write(&map_path, "## Destination\nShip local search.\n").expect("fresh map");
+    let fresh_ticket = "Type: research\nStatus: claimed\n\n## Question\nWhat should ship first?\n";
+    fs::write(&ticket_path, fresh_ticket).expect("fresh ticket");
+    let detail =
+        work_record_detail(&reader, &index, record.subject_id.as_str()).expect("Wayfinder detail");
+    let handoff = work_record_handoff(&reader, &index, record.subject_id.as_str())
+        .expect("Wayfinder handoff");
+
+    assert!(detail.record.facts.iter().any(|fact| {
+        fact.key == "wayfinder.frontier.count" && fact.value == backstage_core::FactValue::Count(0)
+    }));
+    assert!(
+        detail
+            .record
+            .warnings
+            .iter()
+            .all(|warning| warning.code != "wayfinder_map_section_empty")
+    );
+    assert_eq!(
+        detail
+            .capabilities
+            .iter()
+            .map(|view| view.capability.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["overview", "questions", "source"]
+    );
+    assert!(detail.capabilities[1].blocks.iter().any(|block| matches!(
+        block,
+        StructuredBlock::ItemCollection { items, .. }
+            if items.iter().any(|item| item.facts.iter().any(|fact| {
+                fact.key == "wayfinder.ticket.status"
+                    && fact.value == backstage_core::FactValue::Text("claimed".to_owned())
+            }))
+    )));
+    assert_eq!(
+        handoff.handoff.primary_source_path.as_deref(),
+        Some(".scratch/search/map.md")
+    );
+    assert!(
+        handoff
+            .handoff
+            .continuation_prompt
+            .contains("Frontier: None")
+    );
+    assert_eq!(
+        fs::read_to_string(&ticket_path).expect("unchanged ticket"),
+        fresh_ticket
+    );
+    assert_eq!(
+        fs::read_to_string(&map_path).expect("unchanged map"),
+        "## Destination\nShip local search.\n"
+    );
+}
+
+#[test]
+fn local_wayfinder_keeps_partial_safe_sources_when_ticket_members_are_oversized_or_non_utf8() {
+    let root = TempDir::new().expect("root");
+    let effort = root.path().join(".scratch/partial/issues");
+    fs::create_dir_all(&effort).expect("effort");
+    fs::write(
+        root.path().join(".scratch/partial/map.md"),
+        "## Destination\nKeep partial source readable.\n",
+    )
+    .expect("map");
+    fs::write(effort.join("01-oversized.md"), vec![b'x'; 512]).expect("oversized ticket");
+    fs::write(
+        effort.join("02-non-utf8.md"),
+        [
+            b'T', b'y', b'p', b'e', b':', b' ', b't', b'a', b's', b'k', b'\n', 0xff,
+        ],
+    )
+    .expect("non-UTF-8 ticket");
+    let reader = ContainedReader::approve(root.path(), 128).expect("reader");
+    let discovered = discover_projects(&reader, &ScanPolicy::default(), &CancellationToken::new());
+    let index = build_index(
+        &reader,
+        discovered.projects,
+        1,
+        "2026-08-13T12:00:00Z".to_owned(),
+        discovered.warnings,
+    );
+    let record = index.projects[0]
+        .records
+        .iter()
+        .find(|record| record.locator.format_id == "wayfinder-local")
+        .expect("partial Wayfinder record");
+
+    assert_eq!(record.sources.len(), 3);
+    assert!(record.fingerprint.is_none());
+    assert!(record.warnings.iter().any(|warning| {
+        warning.source_path.as_deref() == Some(".scratch/partial/issues/01-oversized.md")
+    }));
+    assert!(record.warnings.iter().any(|warning| {
+        warning.code == "wayfinder_ticket_not_utf8"
+            && warning.source_path.as_deref() == Some(".scratch/partial/issues/02-non-utf8.md")
+    }));
+    assert!(
+        record
+            .facts
+            .iter()
+            .all(|fact| fact.key != "wayfinder.frontier.count")
+    );
+    let detail = work_record_detail(&reader, &index, record.subject_id.as_str())
+        .expect("partial Wayfinder detail");
+    let source = detail
+        .capabilities
+        .iter()
+        .find(|view| view.capability.id == "source")
+        .expect("Source view");
+    assert!(source.blocks.iter().any(|block| matches!(
+        block,
+        StructuredBlock::MarkdownSection { source, .. }
+            if source.relative_path == ".scratch/partial/map.md"
+    )));
+    assert!(source.blocks.iter().any(|block| matches!(
+        block,
+        StructuredBlock::Warning { warning, .. }
+            if warning.source_path.as_deref()
+                == Some(".scratch/partial/issues/01-oversized.md")
+    )));
+    let handoff = work_record_handoff(&reader, &index, record.subject_id.as_str())
+        .expect("partial Wayfinder handoff");
+    assert!(
+        handoff
+            .handoff
+            .continuation_prompt
+            .contains("Frontier: Unavailable")
+    );
+}
+
+#[test]
+fn remote_wayfinder_links_and_similar_map_names_do_not_create_local_wayfinder_records() {
+    let root = TempDir::new().expect("root");
+    fs::write(
+        root.path().join("map.md"),
+        "[Remote map](https://github.com/example/repo/issues/1)\n",
+    )
+    .expect("remote link");
+    let reader = ContainedReader::approve(root.path(), 1024 * 1024).expect("reader");
+    let discovered = discover_projects(&reader, &ScanPolicy::default(), &CancellationToken::new());
+    let index = build_index(
+        &reader,
+        discovered.projects,
+        1,
+        "2026-08-13T12:00:00Z".to_owned(),
+        discovered.warnings,
+    );
+
+    assert!(
+        index.projects[0]
+            .records
+            .iter()
+            .all(|record| record.locator.format_id != "wayfinder-local")
+    );
+    assert!(
+        index.projects[0]
+            .records
+            .iter()
+            .any(|record| record.locator.format_id == "markdown")
+    );
+}
+
+#[test]
+fn neutral_detail_keeps_readable_members_when_one_member_fails() {
+    let fixture = FixtureRepo::open_spec();
+    let reader = ContainedReader::approve(fixture.path(), 1024 * 1024).expect("approve fixture");
+    let discovered = discover_projects(&reader, &ScanPolicy::default(), &CancellationToken::new());
+    let index = build_index(
+        &reader,
+        discovered.projects,
+        1,
+        "2026-08-13T12:00:00Z".to_owned(),
+        discovered.warnings,
+    );
+    let record = index.projects[0]
+        .records
+        .iter()
+        .find(|record| record.locator.format_id == "openspec")
+        .expect("OpenSpec record");
+    fs::remove_file(
+        fixture
+            .path()
+            .join("openspec/changes/ship-search/design.md"),
+    )
+    .expect("remove one member after indexing");
+
+    let detail = work_record_detail(&reader, &index, record.subject_id.as_str())
+        .expect("partial neutral detail");
+    let source = detail
+        .capabilities
+        .iter()
+        .find(|view| view.capability.id == "source")
+        .expect("Source capability");
+
+    assert!(source.blocks.iter().any(|block| matches!(
+        block,
+        StructuredBlock::MarkdownSection { source, .. }
+            if source.relative_path.ends_with("proposal.md")
+    )));
+    assert!(source.blocks.iter().any(|block| matches!(
+        block,
+        StructuredBlock::Warning { warning, .. }
+            if warning.source_path.as_deref()
+                == Some("openspec/changes/ship-search/design.md")
+    )));
+    assert!(detail.fingerprint.is_none());
 }
 
 #[test]
@@ -566,6 +1055,67 @@ fn catalog_cancellation_publishes_one_bounded_partial_warning() {
         .collect::<Vec<_>>();
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].message.contains("partial"));
+}
+
+#[test]
+fn nested_project_neutral_capture_uses_project_relative_paths() {
+    let root = TempDir::new().expect("root tempdir");
+    let project = root.path().join("nested-project");
+    let change = project.join("openspec/changes/nested-change");
+    fs::create_dir_all(&change).expect("create OpenSpec change");
+    fs::write(
+        change.join("proposal.md"),
+        "# Proposal\n\n## Why\nNested.\n",
+    )
+    .expect("write proposal");
+    fs::write(
+        change.join("tasks.md"),
+        "# Tasks\n\n- [ ] Keep nested projects readable\n",
+    )
+    .expect("write tasks");
+    let project = fs::canonicalize(project).expect("canonical project path");
+    let reader = ContainedReader::approve(root.path(), 1024 * 1024).expect("approve parent root");
+    let index = build_index(
+        &reader,
+        vec![ProjectCandidate {
+            id: "project_nested_neutral".to_owned(),
+            name: "nested-project".to_owned(),
+            root_path: project.to_string_lossy().into_owned(),
+            git: None,
+        }],
+        1,
+        "2026-08-15T12:00:00Z".to_owned(),
+        vec![],
+    );
+    let record = index.projects[0]
+        .records
+        .iter()
+        .find(|record| record.locator.format_id == "openspec")
+        .expect("neutral OpenSpec record");
+
+    assert!(record.fingerprint.is_some());
+    assert!(record.facts.iter().any(|fact| {
+        fact.key == "openspec.task.total_count" && fact.value == backstage_core::FactValue::Count(1)
+    }));
+    assert!(record.warnings.iter().all(|warning| {
+        warning.code != "incomplete_source_snapshot"
+            && warning.code != "openspec_progress_unavailable"
+    }));
+
+    let detail = work_record_detail(&reader, &index, record.subject_id.as_str())
+        .expect("nested neutral detail");
+    assert!(detail.fingerprint.is_some());
+    let source = detail
+        .capabilities
+        .iter()
+        .find(|view| view.capability.id == "source")
+        .expect("source capability");
+    assert!(source.blocks.iter().any(|block| matches!(
+        block,
+        StructuredBlock::MarkdownSection { source, .. }
+            if source.relative_path
+                == "openspec/changes/nested-change/tasks.md"
+    )));
 }
 
 #[test]

@@ -110,10 +110,176 @@ export interface MarkdownDocument {
   sourceModifiedUnixNanos: SourceTimestamp;
 }
 
+export interface RecordLocator {
+  projectId: string;
+  formatId: string;
+  adapterRecordKey: string;
+}
+
+export type RecognitionLevel = "recognized" | "possible" | "plain";
+
+export interface WorkRecordRecognition {
+  level: RecognitionLevel;
+  adapterId: string;
+  adapterVersion: number;
+  evidence: string[];
+}
+
+export interface WorkRecordSource {
+  relativePath: string;
+  sourceModifiedUnixNanos: SourceTimestamp;
+}
+
+export interface FactProvenance {
+  adapterId: string;
+  sourcePaths: string[];
+}
+
+export type FactValue =
+  | { type: "text"; value: string }
+  | { type: "count"; value: number }
+  | { type: "boolean"; value: boolean }
+  | { type: "date"; value: string };
+
+export interface SummaryFact {
+  key: string;
+  label: string;
+  value: FactValue;
+  provenance: FactProvenance;
+}
+
+export interface WorkRecordWarning {
+  code: string;
+  message: string;
+  sourcePath?: string;
+  line?: number;
+}
+
+export interface Capability {
+  id: string;
+  label: string;
+}
+
+export type Decision = "undecided" | "approved" | "rejected";
+export type Priority = "low" | "medium" | "high";
+export type Disposition =
+  { status: "applicable" } | { status: "obsolete" } | { status: "superseded"; replacement: string };
+
+export interface WorkRecordAnnotation {
+  decision: Decision;
+  disposition: Disposition;
+  favorite: boolean;
+  todo: boolean;
+  priority: Priority | null;
+}
+
+export type AnnotationCommand =
+  | { command: "set_decision"; value: Decision }
+  | { command: "set_disposition"; value: Disposition }
+  | { command: "set_favorite"; value: boolean }
+  | { command: "set_todo"; value: boolean }
+  | { command: "set_priority"; value: Priority | null };
+
+export interface AnnotationTarget {
+  subjectId: string;
+  label: string;
+  exactLocatorKey: string;
+  available: boolean;
+}
+
+export interface WorkRecord {
+  subjectId: string;
+  locator: RecordLocator;
+  displayName: string;
+  recognition: WorkRecordRecognition;
+  sources: WorkRecordSource[];
+  facts: SummaryFact[];
+  warnings: WorkRecordWarning[];
+  capabilities: Capability[];
+  annotation?: WorkRecordAnnotation;
+  sourceModifiedUnixNanos: SourceTimestamp;
+  fingerprint?: string;
+}
+
+export interface SourceReference {
+  relativePath: string;
+  line?: number;
+}
+
+export interface StructuredRelationship {
+  kind: string;
+  targetSubjectId: string;
+  label: string;
+}
+
+export interface StructuredItem {
+  id: string;
+  title: string;
+  markdown?: string;
+  source: SourceReference;
+  facts: SummaryFact[];
+  relationships: StructuredRelationship[];
+}
+
+export type StructuredBlock =
+  | {
+      kind: "markdown_section";
+      id: string;
+      title: string;
+      markdown: string;
+      source: SourceReference;
+    }
+  | { kind: "fact_register"; id: string; title: string; facts: SummaryFact[] }
+  | { kind: "progress"; id: string; label: string; completed: number; total: number }
+  | { kind: "item_collection"; id: string; title: string; items: StructuredItem[] }
+  | {
+      kind: "relationship_list";
+      id: string;
+      title: string;
+      relationships: StructuredRelationship[];
+    }
+  | { kind: "empty_state"; id: string; message: string }
+  | { kind: "warning"; id: string; warning: WorkRecordWarning }
+  | { kind: "source_list"; id: string; title: string; sources: SourceReference[] };
+
+export interface CapabilityView {
+  capability: Capability;
+  blocks: StructuredBlock[];
+}
+
+export interface WorkRecordDetail {
+  rootId: string;
+  subjectId: string;
+  indexGeneration: number;
+  projectId: string;
+  projectName: string;
+  projectRoot: string;
+  git: GitContext | null;
+  record: WorkRecord;
+  capabilities: CapabilityView[];
+  fingerprint?: string;
+  warnings: WorkRecordWarning[];
+}
+
+export interface AdapterHandoff {
+  primarySourcePath?: string;
+  continuationPrompt: string;
+}
+
+export interface WorkRecordHandoffDetail {
+  rootId: string;
+  subjectId: string;
+  indexGeneration: number;
+  handoff: AdapterHandoff;
+}
+
 export interface IndexedProject {
   project: Project;
   bundles: IndexedBundle[];
   markdownDocuments: MarkdownDocument[];
+  records?: WorkRecord[];
+  sourceCount?: number;
+  registryWarnings?: WorkRecordWarning[];
 }
 
 export interface IndexSnapshot {
@@ -237,6 +403,32 @@ export interface BackstageApi {
   getIndex(rootId: string): Promise<IndexSnapshot | null>;
   getArtifactDetail(rootId: string, artifactId: string): Promise<ArtifactDetail>;
   getMarkdownDetail(rootId: string, documentId: string): Promise<MarkdownDetail>;
+  getWorkRecordDetail?(
+    rootId: string,
+    subjectId: string,
+    expectedGeneration: number,
+  ): Promise<WorkRecordDetail>;
+  getWorkRecordHandoff?(
+    rootId: string,
+    subjectId: string,
+    expectedGeneration: number,
+  ): Promise<WorkRecordHandoffDetail>;
+  copyWorkRecordPath?(
+    rootId: string,
+    subjectId: string,
+    expectedGeneration: number,
+  ): Promise<string>;
+  copyWorkRecordPrompt?(
+    rootId: string,
+    subjectId: string,
+    expectedGeneration: number,
+  ): Promise<string>;
+  getWorkRecordAnnotation?(subjectId: string): Promise<WorkRecordAnnotation>;
+  getWorkRecordAnnotationTargets?(subjectId: string): Promise<AnnotationTarget[]>;
+  updateWorkRecordAnnotation?(
+    subjectId: string,
+    command: AnnotationCommand,
+  ): Promise<WorkRecordAnnotation>;
   getGeneratedView(rootId: string, bundleId: string): Promise<GeneratedView>;
   requestSummary(rootId: string, bundleId: string): Promise<GeneratedView>;
   cancelSummary(requestId: string): Promise<boolean>;
@@ -265,6 +457,44 @@ const tauriApi: BackstageApi = {
     invoke<ArtifactDetail>("get_artifact_detail", { rootId, artifactId }),
   getMarkdownDetail: (rootId, documentId) =>
     invoke<MarkdownDetail>("get_markdown_detail", { rootId, documentId }),
+  getWorkRecordDetail: (rootId, subjectId, expectedGeneration) =>
+    invoke<WorkRecordDetail>("get_work_record_detail", {
+      rootId,
+      subjectId,
+      expectedGeneration,
+    }),
+  getWorkRecordHandoff: (rootId, subjectId, expectedGeneration) =>
+    invoke<WorkRecordHandoffDetail>("get_work_record_handoff", {
+      rootId,
+      subjectId,
+      expectedGeneration,
+    }),
+  copyWorkRecordPath: async (rootId, subjectId, expectedGeneration) => {
+    const detail = await invoke<WorkRecordHandoffDetail>("get_work_record_handoff", {
+      rootId,
+      subjectId,
+      expectedGeneration,
+    });
+    const path = detail.handoff.primarySourcePath;
+    if (!path) throw new Error("No source path is available for this Work Record");
+    await writeText(path);
+    return path;
+  },
+  copyWorkRecordPrompt: async (rootId, subjectId, expectedGeneration) => {
+    const detail = await invoke<WorkRecordHandoffDetail>("get_work_record_handoff", {
+      rootId,
+      subjectId,
+      expectedGeneration,
+    });
+    await writeText(detail.handoff.continuationPrompt);
+    return detail.handoff.continuationPrompt;
+  },
+  getWorkRecordAnnotation: (subjectId) =>
+    invoke<WorkRecordAnnotation>("get_work_record_annotation", { subjectId }),
+  getWorkRecordAnnotationTargets: (subjectId) =>
+    invoke<AnnotationTarget[]>("get_work_record_annotation_targets", { subjectId }),
+  updateWorkRecordAnnotation: (subjectId, command) =>
+    invoke<WorkRecordAnnotation>("update_work_record_annotation", { subjectId, command }),
   getGeneratedView: (rootId, bundleId) =>
     invoke<GeneratedView>("get_generated_view", { rootId, bundleId }),
   requestSummary: (rootId, bundleId) =>

@@ -1,17 +1,23 @@
 use std::collections::BTreeMap;
 
 use backstage_core::{
-    ArtifactBundle, MarkdownDocument, OpenSpecPrimaryStatus, OpenSpecProgress, SourceFingerprint,
-    assess_openspec_status,
+    AdapterDescriptor, ArtifactBundle, ArtifactRecognition, BundleKind, Capability, FactProvenance,
+    FactValue, MarkdownDocument, OpenSpecCustody, OpenSpecPrimaryStatus, OpenSpecProgress,
+    RecognitionLevel, RecordLocator, SourceFingerprint, SummaryFact, WorkRecord,
+    WorkRecordRecognition, WorkRecordSource, WorkRecordWarning, assess_openspec_status,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::discovery::{ProjectCandidate, ScanWarning};
 
+pub const CURRENT_INDEX_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexSnapshot {
+    #[serde(default)]
+    pub schema_version: u32,
     pub root_id: String,
     pub generation: u64,
     pub indexed_at: String,
@@ -28,6 +34,12 @@ pub struct IndexedProject {
     pub bundles: Vec<IndexedBundle>,
     #[serde(default)]
     pub markdown_documents: Vec<MarkdownDocument>,
+    #[serde(default)]
+    pub records: Vec<WorkRecord>,
+    #[serde(default)]
+    pub source_count: usize,
+    #[serde(default)]
+    pub registry_warnings: Vec<WorkRecordWarning>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -74,6 +86,232 @@ impl<'de> Deserialize<'de> for IndexedBundle {
             warnings: data.warnings,
         })
     }
+}
+
+pub fn migrate_legacy_snapshot(snapshot: &mut IndexSnapshot) {
+    if snapshot.schema_version >= CURRENT_INDEX_SCHEMA_VERSION {
+        return;
+    }
+    for project in &mut snapshot.projects {
+        if project.records.is_empty() {
+            project.records = translate_legacy_project(project);
+        }
+        if project.source_count == 0 {
+            project.source_count = project
+                .markdown_documents
+                .iter()
+                .map(|document| document.relative_path.as_str())
+                .chain(
+                    project
+                        .bundles
+                        .iter()
+                        .flat_map(|bundle| &bundle.bundle.members)
+                        .map(|member| member.relative_path.as_str()),
+                )
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+        }
+    }
+    snapshot.schema_version = CURRENT_INDEX_SCHEMA_VERSION;
+}
+
+fn translate_legacy_project(project: &IndexedProject) -> Vec<WorkRecord> {
+    let mut records = Vec::new();
+    let mut claimed = std::collections::BTreeSet::new();
+    for indexed in &project.bundles {
+        let Some((descriptor, record_key, level, capabilities)) = legacy_bundle_contract(indexed)
+        else {
+            continue;
+        };
+        let sources = indexed
+            .bundle
+            .members
+            .iter()
+            .map(|member| {
+                claimed.insert(member.relative_path.clone());
+                WorkRecordSource::new(
+                    member.relative_path.clone(),
+                    project
+                        .markdown_documents
+                        .iter()
+                        .find(|document| document.relative_path == member.relative_path)
+                        .and_then(|document| document.source_modified_unix_nanos),
+                )
+            })
+            .collect::<Vec<_>>();
+        let evidence = match &indexed.bundle.recognition {
+            ArtifactRecognition::Recognized { detector } => {
+                vec![format!("Translated from legacy recognition by {detector}")]
+            }
+            ArtifactRecognition::Possible { reason } => vec![reason.clone()],
+        };
+        let recognition = WorkRecordRecognition::new(level, &descriptor, evidence);
+        let mut facts = vec![SummaryFact::new(
+            "work_record.source_count",
+            "Sources",
+            FactValue::Count(sources.len() as u64),
+            FactProvenance::new(
+                descriptor.adapter_id(),
+                sources
+                    .iter()
+                    .map(|source| source.relative_path.clone())
+                    .collect(),
+            ),
+        )];
+        if indexed.bundle.kind == BundleKind::OpenSpecChange {
+            let provenance = indexed
+                .bundle
+                .members
+                .iter()
+                .filter(|member| member.relative_path.ends_with("/tasks.md"))
+                .map(|member| member.relative_path.clone())
+                .collect::<Vec<_>>();
+            if let Some(custody) = &indexed.bundle.custody {
+                facts.push(SummaryFact::new(
+                    "openspec.custody",
+                    "Custody",
+                    FactValue::Text(
+                        match custody {
+                            OpenSpecCustody::Current => "current",
+                            OpenSpecCustody::Archived { .. } => "archived",
+                        }
+                        .to_owned(),
+                    ),
+                    FactProvenance::new(descriptor.adapter_id(), vec![]),
+                ));
+            }
+            if let Some(status) = indexed.primary_status {
+                facts.push(SummaryFact::new(
+                    "openspec.primary_status",
+                    "Status",
+                    FactValue::Text(
+                        match status {
+                            OpenSpecPrimaryStatus::Active => "active",
+                            OpenSpecPrimaryStatus::Done => "done",
+                            OpenSpecPrimaryStatus::Archived => "archived",
+                        }
+                        .to_owned(),
+                    ),
+                    FactProvenance::new(descriptor.adapter_id(), provenance.clone()),
+                ));
+            }
+            if let OpenSpecProgress::Available(progress) = &indexed.progress {
+                facts.extend([
+                    SummaryFact::new(
+                        "openspec.task.total_count",
+                        "Tasks",
+                        FactValue::Count(progress.total as u64),
+                        FactProvenance::new(descriptor.adapter_id(), provenance.clone()),
+                    ),
+                    SummaryFact::new(
+                        "openspec.task.done_count",
+                        "Done",
+                        FactValue::Count(progress.completed as u64),
+                        FactProvenance::new(descriptor.adapter_id(), provenance.clone()),
+                    ),
+                    SummaryFact::new(
+                        "openspec.task.open_count",
+                        "Open",
+                        FactValue::Count(progress.remaining_count as u64),
+                        FactProvenance::new(descriptor.adapter_id(), provenance),
+                    ),
+                ]);
+            }
+        }
+        let warnings = indexed
+            .warnings
+            .iter()
+            .map(|warning| WorkRecordWarning::without_source("legacy_index_warning", warning))
+            .collect();
+        let mut record = WorkRecord::new(
+            RecordLocator::new(&project.project.id, descriptor.format_id(), record_key),
+            indexed.bundle.name.clone(),
+            recognition,
+            sources,
+            facts,
+            warnings,
+            capabilities,
+        );
+        if record.source_modified_unix_nanos.is_none() {
+            record.source_modified_unix_nanos = indexed.source_modified_unix_nanos;
+        }
+        record.fingerprint = indexed.fingerprint.clone();
+        records.push(record);
+    }
+
+    let markdown_descriptor = AdapterDescriptor::new("markdown-v1", "markdown", 1, 40);
+    for document in &project.markdown_documents {
+        if claimed.contains(&document.relative_path) {
+            continue;
+        }
+        records.push(WorkRecord::new(
+            RecordLocator::new(
+                &project.project.id,
+                markdown_descriptor.format_id(),
+                &document.relative_path,
+            ),
+            document
+                .relative_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&document.relative_path),
+            WorkRecordRecognition::new(
+                RecognitionLevel::Plain,
+                &markdown_descriptor,
+                vec!["Translated plain Markdown fallback".to_owned()],
+            ),
+            vec![WorkRecordSource::new(
+                document.relative_path.clone(),
+                document.source_modified_unix_nanos,
+            )],
+            vec![],
+            vec![],
+            vec![Capability::new("source", "Source")],
+        ));
+    }
+    records.sort_by(|left, right| {
+        left.display_name
+            .to_lowercase()
+            .cmp(&right.display_name.to_lowercase())
+            .then_with(|| left.subject_id.cmp(&right.subject_id))
+    });
+    records
+}
+
+fn legacy_bundle_contract(
+    indexed: &IndexedBundle,
+) -> Option<(AdapterDescriptor, String, RecognitionLevel, Vec<Capability>)> {
+    match indexed.bundle.kind {
+        BundleKind::OpenSpecChange => Some((
+            AdapterDescriptor::new("openspec-v1", "openspec", 1, 10),
+            openspec_record_key(&indexed.bundle.members.first()?.relative_path)?,
+            RecognitionLevel::Recognized,
+            vec![
+                Capability::new("overview", "Overview"),
+                Capability::new("tasks", "Tasks"),
+                Capability::new("source", "Source"),
+            ],
+        )),
+        BundleKind::PossibleArtifact => Some((
+            AdapterDescriptor::new("planning-pattern-v1", "planning-pattern", 1, 30),
+            indexed.bundle.members.first()?.relative_path.clone(),
+            RecognitionLevel::Possible,
+            vec![Capability::new("source", "Source")],
+        )),
+    }
+}
+
+fn openspec_record_key(relative_path: &str) -> Option<String> {
+    let parts = relative_path.split('/').collect::<Vec<_>>();
+    if parts.first() != Some(&"openspec") || parts.get(1) != Some(&"changes") {
+        return None;
+    }
+    let length = if parts.get(2) == Some(&"archive") {
+        4
+    } else {
+        3
+    };
+    (parts.len() > length).then(|| parts[..length].join("/"))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

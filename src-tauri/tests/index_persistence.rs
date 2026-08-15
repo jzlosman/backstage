@@ -1,6 +1,7 @@
 use backstage_app_lib::discovery::{GitContext, ProjectCandidate, ScanWarning};
 use backstage_app_lib::index::{
-    IndexPersistence, IndexSession, IndexSnapshot, IndexedBundle, IndexedProject,
+    CURRENT_INDEX_SCHEMA_VERSION, IndexPersistence, IndexSession, IndexSnapshot, IndexedBundle,
+    IndexedProject,
 };
 use backstage_app_lib::storage::SqliteStore;
 use backstage_core::{
@@ -32,6 +33,7 @@ fn index(generation: u64) -> IndexSnapshot {
     .expect("snapshot");
 
     IndexSnapshot {
+        schema_version: CURRENT_INDEX_SCHEMA_VERSION,
         root_id: "root_1".to_owned(),
         generation,
         indexed_at: "2026-08-13T12:00:00Z".to_owned(),
@@ -59,6 +61,9 @@ fn index(generation: u64) -> IndexSnapshot {
                 "README.md",
                 Some(41),
             )],
+            records: vec![],
+            source_count: 1,
+            registry_warnings: vec![],
         }],
         warnings: vec![ScanWarning {
             code: "partial".to_owned(),
@@ -216,4 +221,72 @@ fn cache_write_failure_keeps_the_new_in_memory_index_usable() {
     assert_eq!(session.current(), Some(&expected));
     assert_eq!(session.operational_warnings().len(), 1);
     assert!(session.operational_warnings()[0].contains("disk full"));
+}
+
+#[test]
+fn legacy_bundle_and_document_snapshot_is_translated_to_neutral_records_on_load() {
+    let app_data = tempfile::TempDir::new().expect("app data");
+    let database = app_data.path().join("index.sqlite3");
+    let root = backstage_core::ApprovedRoot::new("/tmp", true).expect("root");
+    let mut legacy = index(3);
+    legacy.root_id = root.id().to_owned();
+    let mut payload = serde_json::to_value(legacy).expect("serialize legacy index");
+    payload
+        .as_object_mut()
+        .expect("index object")
+        .remove("schemaVersion");
+    let project = payload["projects"][0]
+        .as_object_mut()
+        .expect("project object");
+    project.remove("records");
+    project.remove("sourceCount");
+    project.remove("registryWarnings");
+
+    {
+        let store = SqliteStore::open(&database).expect("store");
+        store.upsert_root(&root).expect("store root");
+    }
+    let connection = rusqlite::Connection::open(&database).expect("raw database");
+    connection
+        .execute(
+            "INSERT INTO index_snapshots (root_id, generation, payload, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                root.id(),
+                3_u64,
+                serde_json::to_string(&payload).expect("legacy payload"),
+                "2026-08-13T12:00:00Z"
+            ],
+        )
+        .expect("insert legacy snapshot");
+    drop(connection);
+
+    let store = SqliteStore::open(&database).expect("restart store");
+    let restored = store
+        .load_index(root.id())
+        .expect("load translated index")
+        .expect("translated snapshot");
+
+    assert_eq!(restored.schema_version, CURRENT_INDEX_SCHEMA_VERSION);
+    assert_eq!(restored.projects[0].records.len(), 2);
+    assert_eq!(restored.projects[0].source_count, 2);
+    let openspec = restored.projects[0]
+        .records
+        .iter()
+        .find(|record| record.locator.format_id == "openspec")
+        .expect("translated OpenSpec record");
+    assert_eq!(
+        openspec.locator.adapter_record_key,
+        "openspec/changes/search"
+    );
+    assert_eq!(
+        openspec.fingerprint.as_ref().map(|value| value.as_str()),
+        restored.projects[0].bundles[0]
+            .fingerprint
+            .as_ref()
+            .map(|value| value.as_str())
+    );
+    assert!(restored.projects[0].records.iter().any(|record| {
+        record.locator.format_id == "markdown" && record.sources[0].relative_path == "README.md"
+    }));
 }
